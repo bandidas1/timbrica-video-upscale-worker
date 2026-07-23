@@ -34,6 +34,18 @@ import urllib.request
 import numpy as np
 import runpod
 
+# torchvision >= 0.17 removed transforms.functional_tensor; basicsr 1.4.2
+# still imports it. Register a shim BEFORE basicsr ever loads — this keeps
+# the worker independent of any image-build sed patching.
+import sys as _sys, types as _types
+try:
+    import torchvision.transforms.functional_tensor  # noqa: F401
+except Exception:
+    from torchvision.transforms import functional as _F
+    _shim = _types.ModuleType('torchvision.transforms.functional_tensor')
+    _shim.rgb_to_grayscale = _F.rgb_to_grayscale
+    _sys.modules['torchvision.transforms.functional_tensor'] = _shim
+
 MODELS = {
     # (weights file, netscale, is_compact)
     "general-x4v3": ("realesr-general-x4v3.pth", 4, True),
@@ -149,7 +161,8 @@ def handler(job):
     try:
         _download(in_url, src)
     except Exception as e:
-        return {"error": f"download_failed:{type(e).__name__}"}
+        code = getattr(e, "code", None) or type(e).__name__
+        return {"error": f"download_failed:{code}"}
 
     try:
         meta = _ffprobe(src)
