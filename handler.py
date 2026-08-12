@@ -95,14 +95,16 @@ def _download(url: str, dst: str):
             f.write(buf)
 
 
-def _upload(url: str, src: str) -> int:
+def _upload(url: str, src: str, extra_headers: dict | None = None) -> int:
     size = os.path.getsize(src)
     with open(src, "rb") as f:
         # Read fully: urllib streams file objects chunked, but a known length
         # lets the receiving side verify truncation (Content-Length check).
         body = f.read()
-    with _http(url, method="PUT", data=body,
-               headers={"Content-Type": "video/mp4", "Content-Length": str(size)}) as resp:
+    headers = {"Content-Type": "video/mp4", "Content-Length": str(size)}
+    if extra_headers:
+        headers.update(extra_headers)
+    with _http(url, method="PUT", data=body, headers=headers) as resp:
         resp.read()
     return size
 
@@ -275,8 +277,14 @@ def handler(job):
     upsampler = _build_upsampler(model_key)
     encoder = _pick_encoder(ow, oh)
 
+    # The fps filter pins the pipe to the SAME rate the encoder stamps.
+    # Without it, VFR sources (phone/screen recordings) got CFR-duplicated by
+    # the rawvideo muxer at the stream's nominal rate while the encoder timed
+    # frames at avg_fps — a 2.96 s VFR clip came out 7.06 s (2.4× slow-motion,
+    # guaranteed audio desync). Measured 2026-08-13 on a real VFR fixture.
     dec = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-i", src,
+         "-vf", f"fps={fps:.6f}",
          "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
         stdout=subprocess.PIPE, bufsize=w * h * 3 * 4,
     )
@@ -359,7 +367,13 @@ def handler(job):
 
     runpod.serverless.progress_update(job, {"pct": 98, "stage": "upload"})
     try:
-        size = _upload(out_url, dst)
+        # Encoder + GPU ride the PUT as headers → the server drops them into a
+        # meta.json sidecar → srv_done telemetry. RunPod's own job output
+        # expires in hours; this is the only durable per-job fleet map.
+        size = _upload(out_url, dst, {
+            "X-Upsc-Encoder": encoder,
+            "X-Upsc-Gpu": _gpu_name(),
+        })
     except Exception as e:
         return {"error": f"upload_failed:{type(e).__name__}"}
 
