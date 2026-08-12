@@ -126,8 +126,28 @@ def _ffprobe(path: str) -> dict:
     if not (0.5 < fps < 240):
         fps = 30.0
     duration = float(info.get("format", {}).get("duration") or v.get("duration") or 0)
+    # Rotation lives in side data (or the legacy rotate tag), and ffmpeg's
+    # decoder AUTOROTATES by default — the raw pipe delivers display-oriented
+    # frames. Probe dims are the UNrotated ones, so without this swap every
+    # phone portrait video reshaped into transposed garbage (proven on a
+    # display_rotation=90 file: pipe emits 720×1280 while probe says 1280×720).
+    rot = 0
+    for sd in (v.get("side_data_list") or []):
+        if sd.get("rotation") is not None:
+            try:
+                rot = int(round(float(sd["rotation"]))) % 360
+            except (TypeError, ValueError):
+                pass
+    if not rot:
+        try:
+            rot = int((v.get("tags") or {}).get("rotate", 0)) % 360
+        except (TypeError, ValueError):
+            rot = 0
+    w, h = int(v["width"]), int(v["height"])
+    if rot in (90, 270):
+        w, h = h, w
     return {
-        "w": int(v["width"]), "h": int(v["height"]),
+        "w": w, "h": h,
         "fps": fps, "duration": duration, "has_audio": a is not None,
     }
 
