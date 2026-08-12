@@ -132,13 +132,44 @@ def _ffprobe(path: str) -> dict:
     }
 
 
-def _nvenc_available() -> bool:
+# NVENC session walls, measured on Ada (RTX 4060/4090, 2026-08-13): the H.264
+# hardware encoder refuses either dimension above 4096 (a 2304×1296 source at
+# ×2 = 4608 wide died exactly here — 26/26 historical failures were this wall),
+# HEVC refuses above 8192. Same limits across the endpoint's whole GPU pool
+# (Ampere 3090/A5000 and Ada 4090/L40S). The web tier sells nothing past
+# HEVC_MAX_PX; the check here is the billing-truth belt for hand-crafted jobs.
+H264_MAX_PX = 4096
+HEVC_MAX_PX = 8192
+
+_enc_list_cache = None
+
+
+def _enc_available(name: str) -> bool:
+    global _enc_list_cache
+    if _enc_list_cache is None:
+        try:
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True, timeout=60)
+            _enc_list_cache = out.stdout
+        except Exception:
+            _enc_list_cache = ""
+    return name in _enc_list_cache
+
+
+def _pick_encoder(ow: int, oh: int) -> str:
+    if max(ow, oh) <= H264_MAX_PX and _enc_available("h264_nvenc"):
+        return "h264_nvenc"
+    if _enc_available("hevc_nvenc"):
+        return "hevc_nvenc"
+    return "libx264"
+
+
+def _tail(path: str, n: int = 400) -> str:
     try:
-        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
-                             capture_output=True, text=True, timeout=60)
-        return "h264_nvenc" in out.stdout
+        with open(path, "r", errors="replace") as f:
+            return f.read()[-n:].strip()
     except Exception:
-        return False
+        return ""
 
 
 def handler(job):
@@ -179,8 +210,14 @@ def handler(job):
     ow, oh = w * scale, h * scale
     total_frames = max(1, int(meta["duration"] * fps))
 
+    # Fail BEFORE any GPU spend: past the HEVC wall no encoder on this fleet
+    # can deliver the frame. The web tier refuses to sell these; reaching this
+    # line means a stale client or a hand-crafted job.
+    if max(ow, oh) > HEVC_MAX_PX:
+        return {"error": "output_dims_unsupported", "out_w": ow, "out_h": oh}
+
     upsampler = _build_upsampler(model_key)
-    encoder = "h264_nvenc" if _nvenc_available() else "libx264"
+    encoder = _pick_encoder(ow, oh)
 
     dec = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-i", src,
@@ -194,11 +231,23 @@ def handler(job):
                 "-c:v", encoder]
     if encoder == "h264_nvenc":
         enc_args += ["-preset", "p5", "-rc", "vbr", "-cq", str(cq), "-b:v", "0"]
+    elif encoder == "hevc_nvenc":
+        # hvc1 tag: QuickTime/Safari refuse the default hev1 sample entry.
+        enc_args += ["-preset", "p5", "-rc", "vbr", "-cq", str(cq), "-b:v", "0",
+                     "-tag:v", "hvc1"]
     else:
         enc_args += ["-preset", "veryfast", "-crf", str(cq)]
     enc_args += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                  "-movflags", "+faststart", dst]
-    enc = subprocess.Popen(enc_args, stdin=subprocess.PIPE)
+    # Encoder stderr goes to a FILE (a PIPE nobody drains deadlocks ffmpeg at
+    # 64 KB) so an encode death reports its real reason instead of surfacing
+    # as a bare BrokenPipeError on our next stdin write.
+    enc_log = os.path.join(workdir, "enc.log")
+    enc_err_f = open(enc_log, "w")
+    try:
+        enc = subprocess.Popen(enc_args, stdin=subprocess.PIPE, stderr=enc_err_f)
+    finally:
+        enc_err_f.close()  # the child holds its own copy of the fd
 
     frame_bytes = w * h * 3
     frames = 0
@@ -220,6 +269,15 @@ def handler(job):
                 last_pct = pct
                 runpod.serverless.progress_update(
                     job, {"pct": min(97, pct), "stage": "upscale"})
+    except BrokenPipeError:
+        # The encoder died under us — its stderr has the real reason (NVENC
+        # session-open refusals land here: the write, not the spawn, fails).
+        try:
+            dec.kill(); enc.kill()
+        except Exception:
+            pass
+        return {"error": f"encode_failed:{encoder}:{_tail(enc_log, 200)}",
+                "frames": frames, "encoder": encoder}
     except Exception as e:
         try:
             dec.kill(); enc.kill()
@@ -238,7 +296,8 @@ def handler(job):
     except Exception:
         pass
     if enc.wait(timeout=1800) != 0:
-        return {"error": "encode_failed"}
+        return {"error": f"encode_failed:{encoder}:{_tail(enc_log, 200)}",
+                "encoder": encoder}
     if frames == 0 or not os.path.exists(dst) or os.path.getsize(dst) < 4096:
         return {"error": "empty_output", "frames": frames}
 
