@@ -156,11 +156,47 @@ def _enc_available(name: str) -> bool:
     return name in _enc_list_cache
 
 
+def _gpu_name() -> str:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15)
+        return (out.stdout or "").strip().splitlines()[0][:24] if out.stdout else "?"
+    except Exception:
+        return "?"
+
+
+def _probe_encoder(name: str, ow: int, oh: int) -> bool:
+    """1-frame null encode at the EXACT session dims. RunPod hosts are a
+    lottery: one 2026-08-13 host refused every hevc_nvenc session ("No capable
+    devices found" — driver/caps, not our params) while the previous worker
+    encoded the same 4608×2592 fine. Only a live open on THIS host proves the
+    encoder; ~1-2 s, before any GPU inference is spent."""
+    args = ["ffmpeg", "-v", "error",
+            "-f", "lavfi", "-i", f"color=c=black:s={ow}x{oh}:r=24:d=1",
+            "-frames:v", "1", "-c:v", name]
+    if name in ("h264_nvenc", "hevc_nvenc"):
+        args += ["-preset", "p5"]
+    args += ["-pix_fmt", "yuv420p", "-f", "null", "-"]
+    try:
+        return subprocess.run(args, capture_output=True, timeout=45).returncode == 0
+    except Exception:
+        return False
+
+
 def _pick_encoder(ow: int, oh: int) -> str:
+    """Hardware ladder, each rung proven on this host — software floor last.
+    libx264 is slower (encode overlaps inference, which still dominates) but
+    it ALWAYS opens; a paid job must never die on an encoder we could have
+    avoided."""
+    ladder = []
     if max(ow, oh) <= H264_MAX_PX and _enc_available("h264_nvenc"):
-        return "h264_nvenc"
+        ladder.append("h264_nvenc")
     if _enc_available("hevc_nvenc"):
-        return "hevc_nvenc"
+        ladder.append("hevc_nvenc")
+    for name in ladder:
+        if _probe_encoder(name, ow, oh):
+            return name
     return "libx264"
 
 
@@ -276,8 +312,8 @@ def handler(job):
             dec.kill(); enc.kill()
         except Exception:
             pass
-        return {"error": f"encode_failed:{encoder}:{_tail(enc_log, 200)}",
-                "frames": frames, "encoder": encoder}
+        return {"error": f"encode_failed:{encoder}:{_gpu_name()}:{_tail(enc_log, 180)}",
+                "frames": frames, "encoder": encoder, "gpu": _gpu_name()}
     except Exception as e:
         try:
             dec.kill(); enc.kill()
@@ -296,8 +332,8 @@ def handler(job):
     except Exception:
         pass
     if enc.wait(timeout=1800) != 0:
-        return {"error": f"encode_failed:{encoder}:{_tail(enc_log, 200)}",
-                "encoder": encoder}
+        return {"error": f"encode_failed:{encoder}:{_gpu_name()}:{_tail(enc_log, 180)}",
+                "encoder": encoder, "gpu": _gpu_name()}
     if frames == 0 or not os.path.exists(dst) or os.path.getsize(dst) < 4096:
         return {"error": "empty_output", "frames": frames}
 
@@ -311,7 +347,7 @@ def handler(job):
         "ok": True, "uploaded": True, "bytes": size, "frames": frames,
         "gpu_ms": int(gpu_ms), "wall_ms": int((time.time() - t0) * 1000),
         "encoder": encoder, "model": model_key, "fps": round(fps, 3),
-        "src_h": h,
+        "src_h": h, "gpu": _gpu_name(),
     }
 
 
