@@ -7,10 +7,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg wget \
 RUN pip install --no-cache-dir runpod==1.7.* numpy opencv-python-headless \
     basicsr==1.4.2 realesrgan==0.3.0
 
-# basicsr 1.4.2 imports torchvision.transforms.functional_tensor, removed in
-# torchvision >= 0.17 — the canonical one-line patch.
-RUN sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' \
-    /usr/local/lib/python3.11/dist-packages/basicsr/data/degradations.py || true
+# ⚠️ NO sed patch here on purpose. basicsr 1.4.2 imports
+# torchvision.transforms.functional_tensor, removed in torchvision >= 0.17 —
+# and handler.py already registers a runtime shim for it BEFORE basicsr loads
+# ("this keeps the worker independent of any image-build sed patching").
+#
+# The line that used to sit here hardcoded
+# /usr/local/lib/python3.11/dist-packages/... and ended in `|| true`, so if pip
+# had put basicsr anywhere else the patch would have silently done nothing and
+# the image would still have built clean. A build step that cannot fail is not
+# a safeguard, it is a comment — and this one was not even needed.
 
 # Bake the weights into the image — deterministic cold start, no runtime fetch.
 RUN mkdir -p /weights \
