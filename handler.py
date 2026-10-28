@@ -7,6 +7,7 @@ only, RunPod caps request bodies at 10 MiB):
     "in_url":  signed GET  → source video bytes,
     "out_url": signed PUT  → where to upload the result mp4 (in PARTS, below),
     "scale": 2 | 4,
+    "out_w", "out_h": int,         # optional: the page's size box (see _target_dims)
     "model": "general-x4v3" | "x4plus",
     "cq": 19,                      # NVENC constant-quality target
     "max_bps": int,                # bitrate ceiling → -maxrate (result-size bound)
@@ -45,6 +46,7 @@ import time
 import urllib.error
 import urllib.request
 
+import cv2
 import numpy as np
 import runpod
 
@@ -194,6 +196,33 @@ def _upload_parts(url: str, src: str, part_bytes: int, extra_headers: dict | Non
             if on_progress:
                 on_progress(offset, total)
     return total, parts
+
+
+def _target_dims(inp: dict, w: int, h: int):
+    """The size the person chose on the page, or None for plain ×scale.
+
+    The page's targets are boxes — «HD 720p», «Full HD», «До 4К» — and until
+    2026-10-29 this worker only knew ×2 and ×4, so «До 4К» on a 1178×660 clip
+    came out 2356×1320 instead of 3840×2152 (refund request №54). The model
+    always runs ×4 and only then resizes, so the box costs the same GPU time as
+    ×2: the frame leaves the network at ×4 and is reduced to the box here.
+
+    The web tier has already validated the box; this is the worker refusing to
+    trust a stale or hand-made one. Anything off — odd sides, smaller than the
+    source, past ×4, a different shape (rotation read differently) — falls
+    back to plain ×scale rather than failing a paid job.
+    """
+    try:
+        tw, th = int(inp.get("out_w") or 0), int(inp.get("out_h") or 0)
+    except (TypeError, ValueError):
+        return None
+    if tw <= 0 or th <= 0 or tw % 2 or th % 2:
+        return None
+    if tw < w or th < h or tw > w * 4 or th > h * 4:
+        return None
+    if abs(tw / th - w / h) > 0.02 * (w / h):
+        return None
+    return tw, th
 
 
 def _ffprobe(path: str) -> dict:
@@ -381,6 +410,9 @@ def handler(job):
 
     w, h, fps = meta["w"], meta["h"], meta["fps"]
     ow, oh = w * scale, h * scale
+    target = _target_dims(inp, w, h)
+    if target:
+        ow, oh = target
     total_frames = max(1, int(meta["duration"] * fps))
 
     # Fail BEFORE any GPU spend: past the HEVC wall no encoder on this fleet
@@ -445,8 +477,12 @@ def handler(job):
                 break
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
             g0 = time.time()
-            out_img, _ = upsampler.enhance(frame, outscale=scale)
+            out_img, _ = upsampler.enhance(frame, outscale=None if target else scale)
             gpu_ms += (time.time() - g0) * 1000
+            if target and (out_img.shape[1], out_img.shape[0]) != (ow, oh):
+                # ×4 down to the box: area averaging is the reduction that does
+                # not alias fine detail the model just made.
+                out_img = cv2.resize(out_img, (ow, oh), interpolation=cv2.INTER_AREA)
             enc.stdin.write(np.ascontiguousarray(out_img).tobytes())
             frames += 1
             pct = 3 + int(93 * frames / max(frames, total_frames))
@@ -503,6 +539,7 @@ def handler(job):
         size, parts = _upload_parts(out_url, dst, part_bytes, {
             "X-Upsc-Encoder": encoder,
             "X-Upsc-Gpu": _gpu_name(),
+            "X-Upsc-Out": f"{ow}x{oh}",
         }, _on_progress)
     except UploadRejected as e:
         return {"error": f"upload_rejected:{e}", "bytes": os.path.getsize(dst)}
@@ -514,6 +551,7 @@ def handler(job):
         "gpu_ms": int(gpu_ms), "wall_ms": int((time.time() - t0) * 1000),
         "encoder": encoder, "model": model_key, "fps": round(fps, 3),
         "src_h": h, "gpu": _gpu_name(), "max_bps": max_bps,
+        "out_w": ow, "out_h": oh, "target": bool(target),
         **_mem_facts(),
     }
 
