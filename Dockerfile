@@ -21,6 +21,16 @@ FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 # той же причине стоит у demucs-воркера.
 ENV TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 
+# ⚠️⚠️ NVENC lives in libnvidia-encode, and the NVIDIA container runtime mounts
+# it ONLY when the image asks for the `video` capability. The pytorch base
+# declares NVIDIA_DRIVER_CAPABILITIES=compute,utility — so whether h264_nvenc /
+# hevc_nvenc worked depended on the HOST: hosts that inject every capability
+# had NVENC, the rest refused the session («No capable devices found», support
+# #1366 on 2026-08-13 — then filed as «a lottery of hosts») and the encoder
+# ladder fell to software libx264 (prod check 2026-11-04: an RTX 4090 host).
+# Read from the image config of sha256:a7cfdae9…, not guessed.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg wget \
     && rm -rf /var/lib/apt/lists/*
 

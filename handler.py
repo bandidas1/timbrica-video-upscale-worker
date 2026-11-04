@@ -171,11 +171,14 @@ DELIVERY_BEAT_S = 30
 DELIVERY_PATIENCE_S = 3600
 
 
-def _delivery_retryable(code: int) -> bool:
+def _delivery_retryable(code: int, error: str = "") -> bool:
     """Worth sending the same bytes again: no answer at all (0 — reset,
-    timeout, refused), 408 / 425 / 429, any 5xx. Every other 4xx is the
-    server's final word about THIS job and retrying cannot change it."""
-    return code == 0 or code in (408, 425, 429) or code >= 500
+    timeout, refused), 408 / 425 / 429, any 5xx, and a 400 whose reason is a
+    body the server saw cut short (`part_truncated` — the wire, not the job).
+    Every other 4xx is the server's final word about THIS job."""
+    if code == 0 or code in (408, 425, 429) or code >= 500:
+        return True
+    return code == 400 and "truncated" in (error or "")
 
 
 def _pause_s(attempt: int) -> float:
@@ -265,9 +268,11 @@ def _deliver_result(job, url: str, src: str, part_bytes: int, extra_headers: dic
         return {"error": reason, "bytes": total, "delivery_tries": state["tries"],
                 "delivery_s": int(clock() - started)}
 
-    def _give_up_now() -> bool:
+    def _give_up_now(pause: float = 0.0) -> bool:
         t = clock()
-        return t - progressed >= patience or (deadline is not None and t >= deadline)
+        # Never start a try that, silent to the end, would outlive the attempt.
+        return t - progressed >= patience or (
+            deadline is not None and t + pause + DELIVERY_STALL_S >= deadline)
 
     known = _remote_size(url, timeout=DELIVERY_STALL_S, file_id=fid)
     if known == -2:
@@ -327,14 +332,14 @@ def _deliver_result(job, url: str, src: str, part_bytes: int, extra_headers: dic
                     progressed = clock()
                 state["acked"] = max(0, min(total, nxt))
                 continue
-            elif not _delivery_retryable(code):
+            elif not _delivery_retryable(code, str(j.get("error", ""))):
                 state["last"] = f"http_{code}:{j.get('error', '')}"
                 return _fail(f"upload_rejected:{state['last']}")
 
             # Transient: count it, wait, ask the server what it has, go again.
             state["tries"] += 1
             state["last"] = f"http_{code}:{j.get('error', '')}" if code else f"net:{j.get('error', '')}"
-            if _give_up_now():
+            if _give_up_now(_pause_s(attempt)):
                 return _fail(f"upload_stalled:{state['last']}")
             pause_until = clock() + _pause_s(attempt)
             attempt += 1
@@ -462,6 +467,17 @@ def _gpu_name() -> str:
         return (out.stdout or "").strip().splitlines()[0][:24] if out.stdout else "?"
     except Exception:
         return "?"
+
+
+def _nvenc_lib() -> bool:
+    """Is libnvidia-encode loadable here — the precondition of every NVENC
+    session (see the Dockerfile: the `video` capability)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libnvidia-encode.so.1")
+        return True
+    except Exception:
+        return False
 
 
 def _mem_facts() -> dict:
@@ -711,6 +727,7 @@ def handler(job):
         "src_h": h, "gpu": _gpu_name(), "max_bps": max_bps,
         "out_w": ow, "out_h": oh, "target": bool(target),
         "delivery_tries": sent.get("delivery_tries", 0), "delivery_s": sent.get("delivery_s", 0),
+        "nvenc_lib": _nvenc_lib(),
         **_mem_facts(),
     }
 

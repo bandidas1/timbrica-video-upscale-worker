@@ -225,8 +225,9 @@ check("outage > patience: not before patience", 3600 <= out.get("delivery_s", 0)
 
 # 7. The attempt's own deadline comes first.
 out, door, beats, payload, clock = run_outage(200, patience=3600, deadline_in=1200)
-check("deadline: stops at the attempt's ceiling", str(out.get("error", "")).startswith("upload_stalled:")
-      and 1200 <= out.get("delivery_s", 0) <= 1200 + 200, out)
+check("deadline: ends BEFORE the attempt's ceiling, never a try that could outlive it",
+      str(out.get("error", "")).startswith("upload_stalled:")
+      and 1200 - 200 <= out.get("delivery_s", 0) <= 1200, out)
 
 # 8. A slow but MOVING link (TSPU-like 150 KB/s): never «stalled»; beats from inside the part.
 out, door, beats, payload, clock = run(20 * MiB, mbps=0.15, part=16 * MiB)
@@ -264,9 +265,14 @@ out = H._deliver_result({"id": "j"}, "https://x/o", p, 48 * MiB, {}, clock=clock
 os.unlink(p)
 check("restart: another encode's bytes are not continued", out.get("uploaded") is True and door.have == payload, out)
 
+# 10c. A part the server saw cut short (400 part_truncated) is the wire, not the job.
+out, door, beats, payload, _ = run(SIZE, faults=lambda n, m: 400 if (n == 1 and m == "PUT") else None)
+check("400 without a reason: final", str(out.get("error", "")).startswith("upload_rejected:http_400"), out)
+
 # 11. The retry classes themselves.
 check("classes", all(H._delivery_retryable(c) for c in (0, 408, 425, 429, 500, 502, 503, 504))
-      and not any(H._delivery_retryable(c) for c in (400, 403, 404, 409, 410, 413, 422)))
+      and not any(H._delivery_retryable(c) for c in (400, 403, 404, 409, 410, 413, 422))
+      and H._delivery_retryable(400, "part_truncated"))
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all delivery checks passed'}")
 sys.exit(1 if FAILS else 0)
