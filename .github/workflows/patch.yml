@@ -1,0 +1,45 @@
+name: patch-layer
+
+# Ship a source fix ONTO the image production already runs, not a rebuild.
+#
+# WHY (measured 2026-11-04 on the sibling workers): a rebuild from the very
+# production commit resolved a different runtime — the Dockerfile pins few
+# packages (numpy, opencv-python-headless, runpod 1.7.* float here too). This
+# appends ONE layer with handler.py to the exact production digest
+# (`crane append`: registry-side, the base layers are never downloaded) and
+# checks the file in the image is the file in this commit. Pin the printed
+# digest in the RunPod template; never a tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "The image production runs: ghcr.io/…/timbrica-video-upscale-worker@sha256:…"
+        required: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Delivery self-check
+        run: python3 delivery_selftest.py
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Append handler.py onto the production image
+        run: |
+          set -eu
+          case "${{ inputs.base }}" in *@sha256:*) ;; *) echo "base must be a DIGEST, not a tag"; exit 1;; esac
+          crane auth login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+          mkdir -p layer && cp handler.py layer/handler.py
+          tar -C layer --owner=0 --group=0 -cf layer.tar handler.py
+          NEW="ghcr.io/${{ github.repository_owner }}/timbrica-video-upscale-worker:patch-${{ github.sha }}"
+          crane append -b "${{ inputs.base }}" -f layer.tar -t "$NEW"
+          echo "pin this in RunPod: ghcr.io/${{ github.repository_owner }}/timbrica-video-upscale-worker@$(crane digest "$NEW")"
+          crane export "$NEW" - | tar -xO handler.py | sha256sum
+          sha256sum handler.py

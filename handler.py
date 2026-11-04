@@ -94,8 +94,108 @@ def _build_upsampler(model_key: str):
         tile=512, tile_pad=10, pre_pad=0,
         half=True,
     )
+    # tile_process() prints «Tile i/N» for every tile of every frame — tens of
+    # thousands of lines per job in the worker's log, each a write on the hot
+    # path. Its module-level print is ours to silence.
+    import realesrgan.utils as _resr_utils
+    _resr_utils.print = lambda *a, **k: None
     _upsampler_cache[model_key] = up
     return up
+
+
+# ── One frame through the network, post-processing ON THE CARD (2026-11-04) ──
+# RealESRGANer.enhance() hands the ×4 output to the CPU as FLOAT32 (a 640×480
+# source: 2560×1920×3×4 B ≈ 59 MB per frame), then clamps, transposes, ×255,
+# rounds and casts it in numpy, and the handler reduced it to the box with
+# cv2 — all on a host CPU shared with neighbours. Measured on an RTX 4060 with
+# the exact realesrgan 0.3.0 / basicsr 1.4.2 code and a real clip: 640×480 →
+# 1440×1080 268–381 → 134–175 ms/frame, 1280×720 → 1920×1080 870–1295 →
+# 366–558 ms/frame (×2.0–2.6), the encoder (NVENC or libx264) 1–4 ms either
+# way. Prod jobs on RTX 4090 spent 480–1860 ms per 720p frame in enhance() —
+# the same CPU work, starved. Here the same values are computed on the card
+# (÷255 in float32 → fp16 network → clamp → area reduction → ×255 → round →
+# uint8 → OpenCV's own area table) and 4.7 MB of uint8 cross the bus: the
+# output is the old output (max |diff| 0). The legacy plain ×2 (no box) keeps
+# its exact cv2 LANCZOS4 reduction.
+_POST_ON_CARD = {"ok": True, "fallback": ""}
+_AREA_TABS: dict = {}
+
+
+def _area_tab(src_n: int, dst_n: int):
+    """OpenCV's own INTER_AREA coverage table (computeResizeAreaTab), as a dense
+    dst×src matrix: the reduction to the box on the card is then two matmuls and
+    reproduces cv2.resize(…, INTER_AREA) — measured max |diff| 0 at 1440×1080 and
+    1920×1080, where torch's 'area' (adaptive pooling bins) was off by up to 52."""
+    W = np.zeros((dst_n, src_n), dtype=np.float32)
+    scale = src_n / dst_n
+    for dx in range(dst_n):
+        fsx1 = dx * scale
+        fsx2 = fsx1 + scale
+        cell = min(scale, src_n - fsx1)
+        sx2 = min(int(np.floor(fsx2)), src_n - 1)
+        sx1 = min(int(np.ceil(fsx1)), sx2)
+        if sx1 - fsx1 > 1e-3:
+            W[dx, sx1 - 1] += (sx1 - fsx1) / cell
+        W[dx, sx1:sx2] += 1.0 / cell
+        if fsx2 - sx2 > 1e-3:
+            W[dx, sx2] += min(min(fsx2 - sx2, 1.0), cell) / cell
+    return W
+
+
+def _area_to_box(out255, oh: int, ow: int):
+    """out255: 1×3×H×W float, already rounded to uint8 values (as cv2 sees it)."""
+    import torch
+    _, _, H, W = out255.shape
+    key = (H, W, oh, ow, str(out255.device))
+    if key not in _AREA_TABS:
+        _AREA_TABS.clear()   # one job, one shape
+        _AREA_TABS[key] = (torch.from_numpy(_area_tab(H, oh)).to(out255.device),
+                           torch.from_numpy(_area_tab(W, ow)).to(out255.device))
+    wy, wx = _AREA_TABS[key]
+    res = torch.einsum("yh,chw,xw->cyx", wy, out255[0], wx).unsqueeze(0)
+    # cv2 takes its integer-factor fast path (rounding half up) when both
+    # factors are whole; otherwise cvRound (half to even) — same as torch.round.
+    if H % oh == 0 and W % ow == 0:
+        return torch.floor(res + 0.5)
+    return torch.round(res)
+
+
+def _frame_bgr(upsampler, frame, ow: int, oh: int, to_box: bool, scale: int):
+    if _POST_ON_CARD["ok"]:
+        try:
+            import torch
+            with torch.no_grad():
+                t = torch.from_numpy(np.array(frame, copy=True)).to(upsampler.device, non_blocking=True)
+                t = t.permute(2, 0, 1)[[2, 1, 0]].unsqueeze(0).float().div_(255.0)
+                upsampler.img = t.half() if upsampler.half else t
+                upsampler.mod_scale = None
+                if upsampler.tile_size > 0:
+                    upsampler.tile_process()
+                else:
+                    upsampler.process()
+                out = upsampler.post_process().float().clamp_(0, 1).mul_(255.0).round_()
+                if to_box and (out.shape[-1], out.shape[-2]) != (ow, oh):
+                    out = _area_to_box(out, oh, ow).clamp_(0, 255)
+                out = out.to(torch.uint8)[0][[2, 1, 0]]
+                img = out.permute(1, 2, 0).contiguous().cpu().numpy()
+            if not to_box and scale != 4:
+                h, w = frame.shape[:2]
+                img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
+            return img
+        except RuntimeError as e:
+            # Out of card memory on a huge frame: the old path keeps the ×4
+            # output in fp16 on the card — finish the job there, never fail it.
+            _POST_ON_CARD["ok"] = False
+            _POST_ON_CARD["fallback"] = f"{type(e).__name__}: {e}"[:160]
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+    out_img, _ = upsampler.enhance(frame, outscale=None if to_box else scale)
+    if to_box and (out_img.shape[1], out_img.shape[0]) != (ow, oh):
+        out_img = cv2.resize(out_img, (ow, oh), interpolation=cv2.INTER_AREA)
+    return out_img
 
 
 def _http(url: str, method: str = "GET", data=None, headers=None, timeout=1800):
@@ -589,6 +689,7 @@ def handler(job):
     t0 = time.time()
     t0_mono = time.monotonic()
     inp = job.get("input") or {}
+    _POST_ON_CARD.update(ok=True, fallback="")   # a warm worker starts every job on the card
     if inp.get("probe"):
         return _encoder_probe_report()
     in_url, out_url = inp.get("in_url"), inp.get("out_url")
@@ -695,12 +796,10 @@ def handler(job):
                 break
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
             g0 = time.time()
-            out_img, _ = upsampler.enhance(frame, outscale=None if target else scale)
+            # ×4 down to the box: area averaging is the reduction that does not
+            # alias fine detail the model just made (on the card, _frame_bgr).
+            out_img = _frame_bgr(upsampler, frame, ow, oh, bool(target), scale)
             gpu_ms += (time.time() - g0) * 1000
-            if target and (out_img.shape[1], out_img.shape[0]) != (ow, oh):
-                # ×4 down to the box: area averaging is the reduction that does
-                # not alias fine detail the model just made.
-                out_img = cv2.resize(out_img, (ow, oh), interpolation=cv2.INTER_AREA)
             enc.stdin.write(np.ascontiguousarray(out_img).tobytes())
             frames += 1
             pct = 3 + int(93 * frames / max(frames, total_frames))
@@ -769,6 +868,7 @@ def handler(job):
         "out_w": ow, "out_h": oh, "target": bool(target),
         "delivery_tries": sent.get("delivery_tries", 0), "delivery_s": sent.get("delivery_s", 0),
         "nvenc_lib": _nvenc_lib(),
+        "post_on_card": _POST_ON_CARD["ok"], "post_fallback": _POST_ON_CARD["fallback"] or None,
         "encoder_probe_err": {k: v[-160:] for k, v in _ENC_PROBE_ERRORS.items()} if encoder == "libx264" else None,
         **_mem_facts(),
     }
