@@ -641,6 +641,50 @@ def _driver_version() -> str:
         return "?"
 
 
+def _bench_post(cfg: dict) -> dict:
+    """{"probe": true, "bench_post": {"w", "h", "frames", "box": [ow, oh]}} —
+    the same frames through the old path (enhance() + cv2) and _frame_bgr,
+    interleaved on THIS host, so card, CPU and neighbours are the same for both.
+    Synthetic frames (lavfi testsrc2): the network's cost does not depend on
+    content. Reports ms/frame each way and whether the outputs are identical."""
+    import torch
+    w, h = int(cfg.get("w", 640)), int(cfg.get("h", 480))
+    n = max(4, min(120, int(cfg.get("frames", 40))))
+    ow, oh = (cfg.get("box") or [w * 2, h * 2])[:2]
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate=25",
+                          "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                         capture_output=True, timeout=120).stdout
+    up = _build_upsampler("general-x4v3")
+    ta = tb = 0.0
+    same = True
+    for i in range(n):
+        f = np.frombuffer(raw[i * w * h * 3:(i + 1) * w * h * 3], dtype=np.uint8).reshape(h, w, 3)
+        a = time.time()
+        o1, _ = up.enhance(f, outscale=None)
+        if (o1.shape[1], o1.shape[0]) != (ow, oh):
+            o1 = cv2.resize(o1, (ow, oh), interpolation=cv2.INTER_AREA)
+        o1 = np.ascontiguousarray(o1)
+        torch.cuda.synchronize()
+        b = time.time()
+        o2 = _frame_bgr(up, f, ow, oh, True, 2)
+        torch.cuda.synchronize()
+        c = time.time()
+        if i >= 2:   # the first frames carry cuDNN autotuning
+            ta += b - a
+            tb += c - b
+        same = same and bool(np.array_equal(o1, o2))
+    m = max(1, n - 2)
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except Exception:
+        cpus = os.cpu_count()
+    return {"bench_post": True, "gpu": _gpu_name(), "driver": _driver_version(), "cpus": cpus,
+            "src": f"{w}x{h}", "box": f"{ow}x{oh}", "frames": n,
+            "old_ms": round(1000 * ta / m, 1), "card_ms": round(1000 * tb / m, 1),
+            "speedup": round(ta / tb, 2) if tb else None, "identical": same,
+            "post_on_card": _POST_ON_CARD["ok"], "post_fallback": _POST_ON_CARD["fallback"] or None}
+
+
 def _encoder_probe_report() -> dict:
     """{"probe": true} — what THIS host can encode, and why not, without a
     model, a download or a token (the demucs worker's free probe, same idea)."""
@@ -690,6 +734,8 @@ def handler(job):
     t0_mono = time.monotonic()
     inp = job.get("input") or {}
     _POST_ON_CARD.update(ok=True, fallback="")   # a warm worker starts every job on the card
+    if inp.get("probe") and inp.get("bench_post"):
+        return _bench_post(inp["bench_post"])
     if inp.get("probe"):
         return _encoder_probe_report()
     in_url, out_url = inp.get("in_url"), inp.get("out_url")
