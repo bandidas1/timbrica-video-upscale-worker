@@ -42,6 +42,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -327,6 +328,43 @@ class _CountingBody:
         return len(self.data)
 
 
+# ── A progress beat must not outlive its job (2026-11-04) ──
+# runpod.serverless.progress_update() posts {"status": "IN_PROGRESS", "output":
+# …} to the SAME job-done URL the final result goes to, from a fire-and-forget
+# thread with retries of its own (runpod 1.7.13: rp_progress.py → rp_http.py
+# send_result). A beat still on the wire when the handler returns can land
+# AFTER the result and turn a finished job back to IN_PROGRESS for good. Prod
+# 04.11, job 13494d61…: the file was on our server and the row done 10 s after
+# the start; RunPod kept IN_PROGRESS with the delivery's last beat as output
+# while the worker sat IDLE and was then stopped. The delivery beats (hb) right
+# before the return made that order likely. So beats go through threads we
+# keep, and handler() waits for them, bounded, before RunPod gets the result.
+_PROGRESS_THREADS: list = []
+PROGRESS_DRAIN_S = 20.0
+
+
+def _progress(job, payload) -> None:
+    try:
+        from runpod.serverless.modules.rp_progress import _thread_target as send
+    except Exception:
+        runpod.serverless.progress_update(job, payload)   # an SDK without it: as before
+        return
+    t = threading.Thread(target=send, args=(job, payload), daemon=True)
+    t.start()
+    _PROGRESS_THREADS.append(t)
+
+
+def _drain_progress(limit_s: float = PROGRESS_DRAIN_S, clock=time.monotonic) -> int:
+    """Wait for every beat still on the wire, at most `limit_s` in all.
+    Returns how many were still in flight when the bound ran out."""
+    end = clock() + limit_s
+    for t in list(_PROGRESS_THREADS):
+        t.join(max(0.0, end - clock()))
+    alive = [t for t in _PROGRESS_THREADS if t.is_alive()]
+    _PROGRESS_THREADS[:] = alive
+    return len(alive)
+
+
 def _deliver_result(job, url: str, src: str, part_bytes: int, extra_headers: dict | None,
                     patience_s: int = 0, deadline=None, clock=time.monotonic, sleep=time.sleep,
                     beat=None) -> dict:
@@ -359,7 +397,7 @@ def _deliver_result(job, url: str, src: str, part_bytes: int, extra_headers: dic
         if state["last"]:
             payload["last"] = state["last"][:60]
         try:
-            (beat or (lambda p: runpod.serverless.progress_update(job, p)))(payload)
+            (beat or (lambda p: _progress(job, p)))(payload)
         except Exception:
             pass   # a lost beat is not a lost file
 
@@ -730,6 +768,15 @@ def _tail(path: str, n: int = 400) -> str:
 
 
 def handler(job):
+    """RunPod's entry: the job, then — before RunPod receives the result —
+    every progress beat still in flight (see _progress)."""
+    try:
+        return _handle(job)
+    finally:
+        _drain_progress()
+
+
+def _handle(job):
     t0 = time.time()
     t0_mono = time.monotonic()
     inp = job.get("input") or {}
@@ -755,7 +802,7 @@ def handler(job):
     src = os.path.join(workdir, "in.bin")
     dst = os.path.join(workdir, "out.mp4")
 
-    runpod.serverless.progress_update(job, {"pct": 1, "stage": "download"})
+    _progress(job, {"pct": 1, "stage": "download"})
     try:
         _download(in_url, src)
     except Exception as e:
@@ -851,7 +898,7 @@ def handler(job):
             pct = 3 + int(93 * frames / max(frames, total_frames))
             if pct != last_pct and (frames % 15 == 0 or pct >= 96):
                 last_pct = pct
-                runpod.serverless.progress_update(
+                _progress(
                     job, {"pct": min(96, pct), "stage": "upscale"})
     except BrokenPipeError:
         # The encoder died under us — its stderr has the real reason (NVENC
@@ -877,7 +924,7 @@ def handler(job):
     # Said out loud: the bar used to freeze at 97 % for as long as the encoder
     # took to flush and rewrite the file for faststart — minutes on a
     # multi-GB result — with nothing to tell "finishing" from "hung".
-    runpod.serverless.progress_update(job, {"pct": 97, "stage": "finalize"})
+    _progress(job, {"pct": 97, "stage": "finalize"})
     dec.wait(timeout=60)
     try:
         enc.stdin.close()

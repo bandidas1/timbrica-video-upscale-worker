@@ -274,5 +274,58 @@ check("classes", all(H._delivery_retryable(c) for c in (0, 408, 425, 429, 500, 5
       and not any(H._delivery_retryable(c) for c in (400, 403, 404, 409, 410, 413, 422))
       and H._delivery_retryable(400, "part_truncated"))
 
+# 12. A progress beat never outlives its job (prod 04.11, job 13494d61…): the SDK
+# posts every beat as {"status": "IN_PROGRESS"} to the job-done URL from a thread
+# of its own, so handler() must not give RunPod the result while one is in flight.
+import threading as _th
+import time as _time
+
+order = []
+
+
+def _slow_beat(job, payload):
+    _time.sleep(0.3)
+    order.append("beat")
+
+
+def _job(job):
+    t = _th.Thread(target=_slow_beat, args=(job, {"hb": 1}), daemon=True)
+    t.start()
+    H._PROGRESS_THREADS.append(t)
+    return {"ok": True}
+
+
+H._PROGRESS_THREADS.clear()
+_saved = H._handle
+H._handle = _job
+out = H.handler({"id": "j", "input": {}})
+order.append("result")
+H._handle = _saved
+check("beat in flight lands before the result", out == {"ok": True} and order == ["beat", "result"], order)
+
+# 12b. …and the wait is bounded: a hung beat does not hold the result forever.
+H._PROGRESS_THREADS.clear()
+_stop = _th.Event()
+_t = _th.Thread(target=_stop.wait, args=(5,), daemon=True)
+_t.start()
+H._PROGRESS_THREADS.append(_t)
+_a = _time.monotonic()
+_left = H._drain_progress(0.2)
+_el = _time.monotonic() - _a
+_stop.set()
+check("drain is bounded", _left == 1 and _el < 1.0, (_left, round(_el, 2)))
+H._PROGRESS_THREADS.clear()
+
+# 12c. Every beat goes through _progress: the one direct SDK call left is its fallback.
+_src = open(os.path.join(HERE, "handler.py"), encoding="utf-8").read()
+check("no direct progress_update", _src.count("runpod.serverless.progress_update(job") == 1
+      and _src.count("runpod.serverless.progress_update(" + chr(10)) == 0)
+
+# 12d. An SDK without rp_progress (this stub): _progress falls back to progress_update.
+_seen = []
+H.runpod.serverless.progress_update = lambda job, p: _seen.append(p)
+H._progress({"id": "j"}, {"pct": 5})
+check("fallback to progress_update", _seen == [{"pct": 5}] and not H._PROGRESS_THREADS, _seen)
+
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all delivery checks passed'}")
 sys.exit(1 if FAILS else 0)
