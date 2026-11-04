@@ -517,9 +517,47 @@ def _probe_encoder(name: str, ow: int, oh: int) -> bool:
         args += ["-preset", "p5"]
     args += ["-pix_fmt", "yuv420p", "-f", "null", "-"]
     try:
-        return subprocess.run(args, capture_output=True, timeout=45).returncode == 0
-    except Exception:
+        out = subprocess.run(args, capture_output=True, timeout=45)
+        if out.returncode != 0:
+            # The reason travels to the job output: 2026-11-04 the ladder fell
+            # to libx264 on an RTX 4090 host WITH libnvidia-encode loadable, and
+            # nothing said why.
+            _ENC_PROBE_ERRORS[name] = (out.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+        return out.returncode == 0
+    except Exception as e:
+        _ENC_PROBE_ERRORS[name] = f"{type(e).__name__}: {e}"[:300]
         return False
+
+
+_ENC_PROBE_ERRORS: dict = {}
+
+
+def _driver_version() -> str:
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=driver_version,name,compute_cap",
+                              "--format=csv,noheader"], capture_output=True, text=True, timeout=15)
+        return (out.stdout or "").strip().splitlines()[0][:80] if out.stdout else "?"
+    except Exception:
+        return "?"
+
+
+def _encoder_probe_report() -> dict:
+    """{"probe": true} — what THIS host can encode, and why not, without a
+    model, a download or a token (the demucs worker's free probe, same idea)."""
+    try:
+        ver = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=20).stdout.splitlines()[0]
+    except Exception as e:
+        ver = f"? {e}"
+    rep = {"probe": True, "gpu": _gpu_name(), "driver": _driver_version(), "ffmpeg": ver[:120],
+           "nvenc_lib": _nvenc_lib(), "caps_env": os.environ.get("NVIDIA_DRIVER_CAPABILITIES", ""),
+           "h264_nvenc_listed": _enc_available("h264_nvenc"), "hevc_nvenc_listed": _enc_available("hevc_nvenc"),
+           "probes": {}}
+    for name in ("h264_nvenc", "hevc_nvenc"):
+        for w, h in ((256, 256), (1920, 1080)):
+            _ENC_PROBE_ERRORS.pop(name, None)
+            okk = _probe_encoder(name, w, h)
+            rep["probes"][f"{name}@{w}x{h}"] = "ok" if okk else _ENC_PROBE_ERRORS.get(name, "failed")
+    return rep
 
 
 def _pick_encoder(ow: int, oh: int) -> str:
@@ -527,6 +565,7 @@ def _pick_encoder(ow: int, oh: int) -> str:
     libx264 is slower (encode overlaps inference, which still dominates) but
     it ALWAYS opens; a paid job must never die on an encoder we could have
     avoided."""
+    _ENC_PROBE_ERRORS.clear()   # a warm worker must not report the last job's reasons
     ladder = []
     if max(ow, oh) <= H264_MAX_PX and _enc_available("h264_nvenc"):
         ladder.append("h264_nvenc")
@@ -550,6 +589,8 @@ def handler(job):
     t0 = time.time()
     t0_mono = time.monotonic()
     inp = job.get("input") or {}
+    if inp.get("probe"):
+        return _encoder_probe_report()
     in_url, out_url = inp.get("in_url"), inp.get("out_url")
     if not in_url or not out_url:
         return {"error": "missing_urls"}
@@ -728,6 +769,7 @@ def handler(job):
         "out_w": ow, "out_h": oh, "target": bool(target),
         "delivery_tries": sent.get("delivery_tries", 0), "delivery_s": sent.get("delivery_s", 0),
         "nvenc_lib": _nvenc_lib(),
+        "encoder_probe_err": {k: v[-160:] for k, v in _ENC_PROBE_ERRORS.items()} if encoder == "libx264" else None,
         **_mem_facts(),
     }
 
