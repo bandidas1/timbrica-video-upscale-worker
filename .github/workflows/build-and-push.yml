@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
   push:
     branches: [master]
-    paths: ['Dockerfile', 'handler.py', '.github/workflows/build-and-push.yml']
+    paths: ['Dockerfile', 'handler.py', 'delivery_selftest.py', '.github/workflows/build-and-push.yml']
 
 jobs:
   build:
@@ -27,6 +27,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Delivery of the finished file is where a paid job was lost on
+      # 2026-11-01 (98 %, then cancelled with the result on this worker's
+      # disk). The self-check runs the real _deliver_result against a fake
+      # door with the server's part semantics: no image is built past a red one.
+      - name: Delivery self-check
+        run: python3 delivery_selftest.py
 
       - name: Free disk space
         run: |

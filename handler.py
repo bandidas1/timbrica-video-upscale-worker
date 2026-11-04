@@ -112,11 +112,6 @@ def _download(url: str, dst: str):
             f.write(buf)
 
 
-class UploadRejected(Exception):
-    """The server said no for good (4xx other than out-of-order) — retrying
-    the same bytes cannot change the answer."""
-
-
 def _json_of(resp_or_err):
     try:
         return json.loads(resp_or_err.read().decode("utf-8", "replace") or "{}")
@@ -124,78 +119,243 @@ def _json_of(resp_or_err):
         return {}
 
 
-def _remote_size(url: str) -> int:
+def _remote_size(url: str, timeout: float = 60, file_id: str = "") -> int:
     """How many bytes of the result the server already holds (GET on the
-    signed result URL). -1 when unknown — the caller then starts from 0 and
-    lets `part_out_of_order` correct it."""
+    signed result URL). -1 when unknown, -2 when the whole file is there.
+    With `file_id` the server counts only bytes of THIS file (see _file_id)."""
     try:
-        with _http(url, method="GET", timeout=60) as resp:
+        with _http(url, method="GET", timeout=timeout,
+                   headers={"X-Upsc-File": file_id} if file_id else None) as resp:
             j = _json_of(resp)
             if j.get("done"):
-                return int(j.get("size", 0)) or -2
+                return -2
             return int(j.get("size", 0))
     except Exception:
         return -1
 
 
-def _upload_parts(url: str, src: str, part_bytes: int, extra_headers: dict | None,
-                  on_progress=None) -> tuple[int, int]:
-    """PUT `src` to `url` in parts. Returns (bytes, parts)."""
+# ── Delivery of the finished file (2026-11-04) ──────────────────────────────
+#
+# WHY THIS IS NOT THE LOOP IT REPLACES. Support 2026-11-01 (user 11231, 85 s
+# 720p → Full HD, 27 000 tokens): the clip was upscaled and encoded in about
+# ten minutes, the page said «98 %, осталось около 2 мин», and half an hour
+# later the server called the job stalled, cancelled it on RunPod — which
+# stopped this worker together with the ONLY copy of the finished file — and
+# refunded. The network from RunPod to the RU origin was failing that day
+# (the same week the clip lane logged nginx 408s for every 50th request), and
+# the old loop could not live through it:
+#   · each part waited up to 600 s on a socket that had gone silent, while
+#     nginx had dropped the request after 60 s — three such waits are the
+#     server's 30-minute stall window, without one byte landing;
+#   · 408 (nginx: «the body stopped coming»), 425 and 429 counted as a final
+#     «no» and ended the delivery on the first one;
+#   · nothing told RunPod — and through it the server — that the worker was
+#     alive and trying, so «cannot reach you» and «hung» looked the same.
+#
+# The rules now:
+#   · silence is detected in DELIVERY_STALL_S (90 s): past nginx's 60 s the
+#     request is dead on the server's side anyway;
+#   · a refusal is final only when retrying the same bytes cannot change it
+#     (403 signature, 404/410 job gone, 413 size, 422 not an mp4); a broken
+#     connection, 408, 425, 429 and 5xx are retried;
+#   · the worker gives up only after `patience_s` WITHOUT ONE ACKNOWLEDGED
+#     BYTE (the server's config sends it; the default covers an hour), and
+#     never past the attempt's own deadline;
+#   · every attempt, every pause and every DELIVERY_BEAT_S of a part in
+#     flight report to RunPod: bytes the server holds, bytes of this part on
+#     the wire, the try number and a counter that always moves. The beat
+#     comes from THIS loop, not a side thread — a hung delivery stops beating,
+#     a live one never does, so the server can tell the two apart.
+DELIVERY_STALL_S = 90
+DELIVERY_BEAT_S = 30
+DELIVERY_PATIENCE_S = 3600
+
+
+def _delivery_retryable(code: int) -> bool:
+    """Worth sending the same bytes again: no answer at all (0 — reset,
+    timeout, refused), 408 / 425 / 429, any 5xx. Every other 4xx is the
+    server's final word about THIS job and retrying cannot change it."""
+    return code == 0 or code in (408, 425, 429) or code >= 500
+
+
+def _pause_s(attempt: int) -> float:
+    """Quick on a single hiccup, at most every 30 s in a long outage."""
+    return (2, 5, 10, 20)[attempt] if attempt < 4 else 30
+
+
+def _file_id(path: str) -> str:
+    """A fingerprint of the encoded file: size + its first and last MiB.
+
+    A restarted attempt (RunPod requeues a job whose worker died) encodes the
+    clip AGAIN — different bytes, very likely a different size — and used to
+    resume at the offset the server held from the dead attempt: the head of
+    one encode glued to the tail of another, an mp4 whose index points into
+    the wrong bytes, sniffed «ftyp» and billed as delivered. With the id the
+    server keeps only parts of the same file and tells a stranger to start
+    over. Identical bytes give the same id, so a genuine resume stays one.
+    """
+    import hashlib
+
+    size = os.path.getsize(path)
+    h = hashlib.sha256(str(size).encode())
+    with open(path, "rb") as f:
+        h.update(f.read(1 << 20))
+        if size > 2 << 20:
+            f.seek(size - (1 << 20))
+        h.update(f.read(1 << 20))
+    return h.hexdigest()[:24]
+
+
+class _CountingBody:
+    """The part as an iterable: http.client sends it piece by piece, and each
+    piece is a chance to beat while a slow part is still on the wire."""
+
+    def __init__(self, data: bytes, on_piece):
+        self.data, self.on_piece = data, on_piece
+
+    def __iter__(self):
+        step = 256 * 1024
+        for i in range(0, len(self.data), step):
+            piece = self.data[i:i + step]
+            yield piece
+            self.on_piece(i + len(piece))
+
+    def __len__(self):
+        return len(self.data)
+
+
+def _deliver_result(job, url: str, src: str, part_bytes: int, extra_headers: dict | None,
+                    patience_s: int = 0, deadline=None, clock=time.monotonic, sleep=time.sleep,
+                    beat=None) -> dict:
+    """Put the finished file on the server, in parts, through a bad network.
+
+    Returns the job-output fragment: {"uploaded": True, "bytes", "parts",
+    "delivery_tries", "delivery_s"} or {"error": ..., "bytes", "delivery_tries"}.
+    `deadline` is a clock() value the delivery must end before (the attempt's
+    own execution ceiling); `beat(payload)` reports to RunPod.
+    """
     total = os.path.getsize(src)
     part_bytes = max(1 << 20, int(part_bytes or DEFAULT_PART_BYTES))
     parts = max(1, (total + part_bytes - 1) // part_bytes)
-    offset = max(0, _remote_size(url))
-    if offset == -2:  # a previous attempt already delivered the whole file
-        return total, parts
-    misses = 0
+    patience = float(patience_s or DELIVERY_PATIENCE_S)
+    fid = _file_id(src)
+    started = progressed = clock()
+    seq = [0]
+    last_beat = [0.0]
+    state = {"acked": 0, "tries": 0, "wire": 0, "last": ""}
+
+    def _beat(force=False):
+        t = clock()
+        if not force and t - last_beat[0] < DELIVERY_BEAT_S:
+            return
+        last_beat[0] = t
+        seq[0] += 1
+        payload = {"pct": 98 + (1 if state["acked"] * 2 >= total else 0), "stage": "upload",
+                   "sent": state["acked"], "wire": state["wire"], "total": total,
+                   "try": state["tries"], "hb": seq[0]}
+        if state["last"]:
+            payload["last"] = state["last"][:60]
+        try:
+            (beat or (lambda p: runpod.serverless.progress_update(job, p)))(payload)
+        except Exception:
+            pass   # a lost beat is not a lost file
+
+    def _fail(reason: str) -> dict:
+        _beat(force=True)
+        return {"error": reason, "bytes": total, "delivery_tries": state["tries"],
+                "delivery_s": int(clock() - started)}
+
+    def _give_up_now() -> bool:
+        t = clock()
+        return t - progressed >= patience or (deadline is not None and t >= deadline)
+
+    known = _remote_size(url, timeout=DELIVERY_STALL_S, file_id=fid)
+    if known == -2:
+        return {"uploaded": True, "bytes": total, "parts": parts, "delivery_tries": 0, "delivery_s": 0}
+    state["acked"] = max(0, known)
+    _beat(force=True)
+    attempt = 0
     with open(src, "rb") as f:
-        while offset < total:
+        while state["acked"] < total:
+            offset = state["acked"]
             f.seek(offset)
             chunk = f.read(min(part_bytes, total - offset))
-            idx = offset // part_bytes
             headers = {
                 "Content-Type": "application/octet-stream",
                 "Content-Length": str(len(chunk)),
                 "X-Upsc-Offset": str(offset),
                 "X-Upsc-Total": str(total),
-                "X-Upsc-Part": str(idx),
+                "X-Upsc-Part": str(offset // part_bytes),
                 "X-Upsc-Parts": str(parts),
+                # How hard delivery was — rides into the job's meta sidecar.
+                "X-Upsc-Tries": str(state["tries"]),
+                "X-Upsc-File": fid,
             }
             if extra_headers:
                 headers.update(extra_headers)
+
+            def _on_piece(n):
+                state["wire"] = n
+                _beat()
+
+            code, j = 0, {}
             try:
-                with _http(url, method="PUT", data=chunk, headers=headers, timeout=600) as resp:
-                    j = _json_of(resp)
-                misses = 0
+                with _http(url, method="PUT", data=_CountingBody(chunk, _on_piece), headers=headers,
+                           timeout=DELIVERY_STALL_S) as resp:
+                    code, j = resp.status, _json_of(resp)
+            except urllib.error.HTTPError as e:
+                code, j = e.code, _json_of(e)
+            except Exception as e:
+                code, j = 0, {"error": type(e).__name__}
+            state["wire"] = 0
+
+            if code == 200:
                 if j.get("done"):
-                    offset = total
+                    state["acked"] = total
                     break
                 nxt = int(j.get("size", offset + len(chunk)))
-                # The server is the authority on where we are — never advance
-                # past what it acknowledged, never re-send what it holds.
-                offset = nxt if nxt > offset else offset + len(chunk)
-            except urllib.error.HTTPError as e:
-                j = _json_of(e)
-                if e.code == 409 and j.get("error") == "part_out_of_order":
-                    offset = int(j.get("size", 0))
+                if nxt > offset:
+                    state["acked"] = min(total, nxt)
+                    progressed = clock()
+                    attempt = 0
+                    _beat(force=True)
                     continue
-                if 400 <= e.code < 500:
-                    raise UploadRejected(f"http_{e.code}:{j.get('error', '')}")
-                misses += 1
-            except Exception:
-                misses += 1
-            if misses:
-                if misses > 6:
-                    raise RuntimeError("upload_gave_up")
-                time.sleep(min(60, 2 ** misses))
-                known = _remote_size(url)
-                if known == -2:
-                    return total, parts
-                if known >= 0:
-                    offset = known
-            if on_progress:
-                on_progress(offset, total)
-    return total, parts
+            elif code == 409 and j.get("error") == "part_out_of_order":
+                # The server is the authority on where we are.
+                nxt = int(j.get("size", 0))
+                if nxt > state["acked"]:
+                    progressed = clock()
+                state["acked"] = max(0, min(total, nxt))
+                continue
+            elif not _delivery_retryable(code):
+                state["last"] = f"http_{code}:{j.get('error', '')}"
+                return _fail(f"upload_rejected:{state['last']}")
+
+            # Transient: count it, wait, ask the server what it has, go again.
+            state["tries"] += 1
+            state["last"] = f"http_{code}:{j.get('error', '')}" if code else f"net:{j.get('error', '')}"
+            if _give_up_now():
+                return _fail(f"upload_stalled:{state['last']}")
+            pause_until = clock() + _pause_s(attempt)
+            attempt += 1
+            _beat(force=True)
+            while clock() < pause_until:
+                sleep(min(DELIVERY_BEAT_S, max(0.05, pause_until - clock())))
+                _beat()
+            known = _remote_size(url, timeout=DELIVERY_STALL_S, file_id=fid)
+            _beat(force=True)
+            if known == -2:
+                state["acked"] = total
+                break
+            if known > state["acked"]:
+                state["acked"] = min(total, known)
+                progressed = clock()
+                attempt = 0
+            elif known >= 0:
+                state["acked"] = known
+    _beat(force=True)
+    return {"uploaded": True, "bytes": total, "parts": parts, "delivery_tries": state["tries"],
+            "delivery_s": int(clock() - started)}
 
 
 def _target_dims(inp: dict, w: int, h: int):
@@ -372,6 +532,7 @@ def _tail(path: str, n: int = 400) -> str:
 
 def handler(job):
     t0 = time.time()
+    t0_mono = time.monotonic()
     inp = job.get("input") or {}
     in_url, out_url = inp.get("in_url"), inp.get("out_url")
     if not in_url or not out_url:
@@ -526,25 +687,22 @@ def handler(job):
     if frames == 0 or not os.path.exists(dst) or os.path.getsize(dst) < 4096:
         return {"error": "empty_output", "frames": frames}
 
-    runpod.serverless.progress_update(job, {"pct": 98, "stage": "upload"})
-
-    def _on_progress(sent, total):
-        runpod.serverless.progress_update(
-            job, {"pct": 98 + (1 if total and sent * 2 >= total else 0), "stage": "upload"})
-
-    try:
+    # Delivery: see _deliver_result. The attempt's own ceiling (RunPod's
+    # executionTimeout, sent by the server as `deadline_s`) bounds the wait;
+    # a minute is left for the result to be posted.
+    deadline_s = int(inp.get("deadline_s", 0) or 0)
+    sent = _deliver_result(
+        job, out_url, dst, part_bytes,
         # Encoder + GPU ride the parts as headers → the server drops them into
         # a meta.json sidecar → srv_done telemetry. RunPod's own job output
         # expires in hours; this is the only durable per-job fleet map.
-        size, parts = _upload_parts(out_url, dst, part_bytes, {
-            "X-Upsc-Encoder": encoder,
-            "X-Upsc-Gpu": _gpu_name(),
-            "X-Upsc-Out": f"{ow}x{oh}",
-        }, _on_progress)
-    except UploadRejected as e:
-        return {"error": f"upload_rejected:{e}", "bytes": os.path.getsize(dst)}
-    except Exception as e:
-        return {"error": f"upload_failed:{type(e).__name__}", "bytes": os.path.getsize(dst)}
+        {"X-Upsc-Encoder": encoder, "X-Upsc-Gpu": _gpu_name(), "X-Upsc-Out": f"{ow}x{oh}"},
+        patience_s=int(inp.get("deliver_patience_s", 0) or 0),
+        deadline=(t0_mono + deadline_s - 60) if deadline_s > 0 else None,
+    )
+    if sent.get("error"):
+        return {**sent, "frames": frames, "encoder": encoder, "gpu": _gpu_name()}
+    size, parts = sent["bytes"], sent["parts"]
 
     return {
         "ok": True, "uploaded": True, "bytes": size, "parts": parts, "frames": frames,
@@ -552,6 +710,7 @@ def handler(job):
         "encoder": encoder, "model": model_key, "fps": round(fps, 3),
         "src_h": h, "gpu": _gpu_name(), "max_bps": max_bps,
         "out_w": ow, "out_h": oh, "target": bool(target),
+        "delivery_tries": sent.get("delivery_tries", 0), "delivery_s": sent.get("delivery_s", 0),
         **_mem_facts(),
     }
 
