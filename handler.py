@@ -541,32 +541,6 @@ def _driver_version() -> str:
         return "?"
 
 
-def _fetch_ffmpeg(url: str) -> str:
-    """Download a static ffmpeg build (probe experiments only) → path to binary."""
-    import tarfile
-    d = tempfile.mkdtemp(prefix="ffx_")
-    arc = os.path.join(d, "ff.tar.xz")
-    _download(url, arc)
-    with tarfile.open(arc) as t:
-        member = next(m for m in t.getmembers() if m.name.endswith("/bin/ffmpeg"))
-        t.extract(member, d)
-    path = os.path.join(d, member.name)
-    os.chmod(path, 0o755)
-    return path
-
-
-def _bench(ffmpeg: str, codec: str, extra: list, w: int, h: int, frames: int = 240) -> dict:
-    """Encode `frames` of testsrc at w×h; frames per second, or the error."""
-    args = [ffmpeg, "-v", "error", "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate=25",
-            "-frames:v", str(frames), "-c:v", codec, *extra, "-pix_fmt", "yuv420p", "-f", "null", "-"]
-    t = time.time()
-    out = subprocess.run(args, capture_output=True, timeout=600)
-    dt = time.time() - t
-    if out.returncode != 0:
-        return {"error": (out.stderr or b"").decode("utf-8", "replace").strip()[-200:]}
-    return {"fps": round(frames / dt, 1)}
-
-
 def _encoder_probe_report() -> dict:
     """{"probe": true} — what THIS host can encode, and why not, without a
     model, a download or a token (the demucs worker's free probe, same idea)."""
@@ -583,33 +557,6 @@ def _encoder_probe_report() -> dict:
             _ENC_PROBE_ERRORS.pop(name, None)
             okk = _probe_encoder(name, w, h)
             rep["probes"][f"{name}@{w}x{h}"] = "ok" if okk else _ENC_PROBE_ERRORS.get(name, "failed")
-    return rep
-
-
-def _probe_experiment(inp: dict) -> dict:
-    """{"probe": true, "ffmpeg_url": …, "bench": [w, h]} — the same NVENC probe
-    with another ffmpeg build, and encode throughput of each encoder on THIS
-    host: is the software fallback the bottleneck, and would a newer ffmpeg
-    open NVENC where 4.4.2 says «unsupported device»?"""
-    rep = _encoder_probe_report()
-    w, h = (inp.get("bench") or [1440, 1080])[:2]
-    rep["bench"] = {"libx264": _bench("ffmpeg", "libx264", ["-preset", "veryfast", "-crf", "19"], w, h),
-                    "h264_nvenc_sys": _bench("ffmpeg", "h264_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0"], w, h)}
-    url = inp.get("ffmpeg_url")
-    if url:
-        try:
-            ff = _fetch_ffmpeg(url)
-            ver = subprocess.run([ff, "-version"], capture_output=True, text=True, timeout=20).stdout.splitlines()[0]
-            rep["new_ffmpeg"] = ver[:120]
-            rep["bench"]["h264_nvenc_new"] = _bench(ff, "h264_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0"], w, h)
-            rep["bench"]["hevc_nvenc_new"] = _bench(ff, "hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0"], w, h)
-            rep["bench"]["libx264_new"] = _bench(ff, "libx264", ["-preset", "veryfast", "-crf", "19"], w, h)
-        except Exception as e:
-            rep["new_ffmpeg"] = f"fetch failed: {type(e).__name__}: {e}"[:200]
-    try:
-        rep["cpus"] = len(os.sched_getaffinity(0))
-    except Exception:
-        rep["cpus"] = os.cpu_count()
     return rep
 
 
@@ -643,7 +590,7 @@ def handler(job):
     t0_mono = time.monotonic()
     inp = job.get("input") or {}
     if inp.get("probe"):
-        return _probe_experiment(inp) if (inp.get("ffmpeg_url") or inp.get("bench")) else _encoder_probe_report()
+        return _encoder_probe_report()
     in_url, out_url = inp.get("in_url"), inp.get("out_url")
     if not in_url or not out_url:
         return {"error": "missing_urls"}
