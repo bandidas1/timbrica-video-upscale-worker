@@ -71,7 +71,7 @@ jobs:
         run: |
           set -eu
           python -m pip install --quiet torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --quiet "safetensors==0.5.3" "huggingface_hub>=0.28"
+          python -m pip install --quiet numpy "safetensors==0.5.3" "huggingface_hub>=0.28"
           python - <<'EOF'
           import hashlib, os
           import torch
