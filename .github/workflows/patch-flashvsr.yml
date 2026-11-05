@@ -129,7 +129,7 @@ jobs:
           import torch
           from flashvsr_attn.reference import reference_block_sparse_attention
           torch.manual_seed(0)
-          q = torch.randn(1, 4, 6, 128, 64); k = torch.randn(1, 4, 9, 128, 64); v = torch.randn(1, 4, 9, 128, 64)
+          q = torch.randn(1, 4, 6, 128, 128); k = torch.randn(1, 4, 9, 128, 128); v = torch.randn(1, 4, 9, 128, 128)  # head_dim 128, as the model
           m = torch.rand(1, 4, 6, 9) < 0.35
           m[0, 1, 2] = False
           d = (E.exact_block_sparse(q, k, v, m) - reference_block_sparse_attention(q, k, v, m)).abs().max().item()
