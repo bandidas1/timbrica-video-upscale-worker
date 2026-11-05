@@ -85,9 +85,19 @@ jobs:
               save_file({k: (v.to(torch.bfloat16) if v.is_floating_point() else v) for k, v in sd.items()}, f"{out}/{f}")
               print(f, os.path.getsize(p), "->", os.path.getsize(f"{out}/{f}"))
               os.remove(p)
+          # ⚠️ hf_hub_download returns a SYMLINK into the HF cache: os.replace moved the link, the
+          # layer got a dangling one, and the first pool card said «Tiny decoder does not exist»
+          # (05.11). Copy the bytes.
+          import shutil
           p = hf_hub_download(os.environ["HF_REPO"], "TCDecoder.ckpt")
-          os.replace(p, f"{out}/TCDecoder.ckpt")
+          shutil.copyfile(os.path.realpath(p), f"{out}/TCDecoder.ckpt")
           EOF
+          # every file the loader opens: a regular file, not a link, and of its real size
+          for f in turbo/dit.safetensors turbo/lq_proj_in.safetensors TCDecoder.ckpt; do
+            p="l3/opt/flashvsr/ckpts/$f"
+            test -f "$p" && test ! -L "$p" || { echo "missing or a link: $p"; exit 1; }
+            s=$(stat -c %s "$p"); echo "$f $s"; [ "$s" -gt 50000000 ] || { echo "too small: $p"; exit 1; }
+          done
           du -sh l3
 
       # The image installs nothing — the engine must import from the LAYERS alone. 05.11 the first
