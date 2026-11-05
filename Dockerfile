@@ -52,6 +52,9 @@ RUN pip install --no-cache-dir runpod==1.7.* numpy opencv-python-headless \
 RUN mkdir -p /weights \
     && wget -q -O /weights/realesr-general-x4v3.pth \
        https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth \
+    && wget -q -O /weights/realesr-general-wdn-x4v3.pth \
+       https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth \
+    && echo "1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca  /weights/realesr-general-wdn-x4v3.pth" | sha256sum -c - \
     && wget -q -O /weights/RealESRGAN_x4plus.pth \
        https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 

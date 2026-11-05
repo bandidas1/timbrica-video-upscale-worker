@@ -12,6 +12,8 @@ name: patch-flashvsr
 #   3. /opt/flashvsr/ckpts — Turbo weights stored in bf16 (the loader casts to bf16 anyway:
 #                           lossless for inference, half the bytes for every cold start),
 #                           sha256 of the fp32 originals checked against the values below.
+#   + /weights/realesr-general-wdn-x4v3.pth — the classic engine's model since 2026-11-06
+#     (the base image was built with x4v3 and x4plus only), sha256-checked;
 #   + handler.py and flashvsr_engine.py on top.
 # Triton itself ships inside the base's torch 2.7.1 wheel (3.3.x: sm_89 and sm_120).
 
@@ -168,6 +170,14 @@ jobs:
 
       - uses: imjasonh/setup-crane@v0.4
 
+      - name: Classic weights the base lacks
+        run: |
+          set -eu
+          mkdir -p l6/weights
+          curl -fsSL -o l6/weights/realesr-general-wdn-x4v3.pth \
+            https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth
+          echo "1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca  l6/weights/realesr-general-wdn-x4v3.pth" | sha256sum -c -
+
       - name: Append onto the production image
         run: |
           set -eu
@@ -177,10 +187,11 @@ jobs:
           tar -C l2 --owner=0 --group=0 -cf l2.tar opt
           tar -C l3 --owner=0 --group=0 -cf l3.tar opt
           tar -C l5 --owner=0 --group=0 -cf l5.tar opt
+          tar -C l6 --owner=0 --group=0 -cf l6.tar weights
           mkdir -p l4 && cp handler.py flashvsr_engine.py l4/
           tar -C l4 --owner=0 --group=0 -cf l4.tar handler.py flashvsr_engine.py
           NEW="ghcr.io/${{ github.repository_owner }}/timbrica-video-upscale-worker:flashvsr-${{ github.sha }}"
-          crane append -b "${{ inputs.base }}" -f l1.tar -f l2.tar -f l3.tar -f l5.tar -f l4.tar -t "$NEW"
+          crane append -b "${{ inputs.base }}" -f l1.tar -f l2.tar -f l3.tar -f l5.tar -f l6.tar -f l4.tar -t "$NEW"
           echo "pin this in RunPod: ghcr.io/${{ github.repository_owner }}/timbrica-video-upscale-worker@$(crane digest "$NEW")"
           crane export "$NEW" - | tar -xO handler.py | sha256sum
           sha256sum handler.py

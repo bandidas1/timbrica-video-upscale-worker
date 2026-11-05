@@ -73,6 +73,13 @@ except Exception:
 MODELS = {
     # (weights file, netscale, is_compact)
     "general-x4v3": ("realesr-general-x4v3.pth", 4, True),
+    # The same compact net WITHOUT the denoise training (Real-ESRGAN's denoise_strength 0).
+    # The site's classic engine since 2026-11-06: on the upscaler bench (16 clips with an
+    # original) it beats x4v3 on every fidelity axis — LPIPS x2 0.195 vs 0.236, x4 0.342 vs
+    # 0.375, PSNR +1.8 / +0.6 dB, NIQE on real old clips 6.2 vs 8.6 — at the same cost (same
+    # architecture); x4v3 smooths texture into a painted look. Shipped as a layer by
+    # patch-flashvsr.yml (sha256-checked), baked by the Dockerfile on a rebuild.
+    "general-wdn-x4v3": ("realesr-general-wdn-x4v3.pth", 4, True),
     "x4plus": ("RealESRGAN_x4plus.pth", 4, False),
 }
 # Stream engines: not per-frame networks but whole-video models with their own runner.
@@ -699,7 +706,7 @@ def _driver_version() -> str:
 
 
 def _bench_post(cfg: dict) -> dict:
-    """{"probe": true, "bench_post": {"w", "h", "frames", "box": [ow, oh]}} —
+    """{"probe": true, "bench_post": {"w", "h", "frames", "box": [ow, oh], "model"?}} —
     the same frames through the old path (enhance() + cv2) and _frame_bgr,
     interleaved on THIS host, so card, CPU and neighbours are the same for both.
     Synthetic frames (lavfi testsrc2): the network's cost does not depend on
@@ -711,7 +718,10 @@ def _bench_post(cfg: dict) -> dict:
     raw = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate=25",
                           "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
                          capture_output=True, timeout=120).stdout
-    up = _build_upsampler("general-x4v3")
+    model = cfg.get("model", "general-x4v3")
+    if model not in MODELS:
+        return {"error": "unknown_model", "model": model}
+    up = _build_upsampler(model)
     ta = tb = 0.0
     same = True
     for i in range(n):
@@ -735,7 +745,7 @@ def _bench_post(cfg: dict) -> dict:
         cpus = len(os.sched_getaffinity(0))
     except Exception:
         cpus = os.cpu_count()
-    return {"bench_post": True, "gpu": _gpu_name(), "driver": _driver_version(), "cpus": cpus,
+    return {"bench_post": True, "model": model, "gpu": _gpu_name(), "driver": _driver_version(), "cpus": cpus,
             "src": f"{w}x{h}", "box": f"{ow}x{oh}", "frames": n,
             "old_ms": round(1000 * ta / m, 1), "card_ms": round(1000 * tb / m, 1),
             "speedup": round(ta / tb, 2) if tb else None, "identical": same,
