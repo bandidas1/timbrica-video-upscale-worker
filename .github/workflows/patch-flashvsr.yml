@@ -124,6 +124,17 @@ jobs:
           p = model_paths_for_mode(Path(E.FVP_DIR), "turbo")
           assert stream_config_for_mode("turbo", device="cpu", decode_every=8, temporal_compression=4, color_correction=True)
           print("engine imports from the layers:", p.dit)
+          # The runtime base has no C compiler, so Triton cannot build its launchers there and the
+          # engine runs exact_block_sparse instead (05.11). It must equal the model's own reference.
+          import torch
+          from flashvsr_attn.reference import reference_block_sparse_attention
+          torch.manual_seed(0)
+          q = torch.randn(1, 4, 6, 128, 64); k = torch.randn(1, 4, 9, 128, 64); v = torch.randn(1, 4, 9, 128, 64)
+          m = torch.rand(1, 4, 6, 9) < 0.35
+          m[0, 1, 2] = False
+          d = (E.exact_block_sparse(q, k, v, m) - reference_block_sparse_attention(q, k, v, m)).abs().max().item()
+          print("exact_block_sparse vs reference: max |diff|", d)
+          assert d < 1e-4, d
           EOF
 
       - uses: imjasonh/setup-crane@v0.4

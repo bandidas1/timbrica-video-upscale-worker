@@ -47,11 +47,51 @@ def _paths():
         sys.path.append(PYDEPS)
 
 
+def _triton_can_build() -> bool:
+    """Triton compiles a small C launcher per kernel (and its CUDA driver module) with the system
+    C compiler at first use. The worker's runtime base has none — the first pool card answered
+    «Failed to find C compiler» (05.11). Without one the stream attention runs exact_block_sparse."""
+    import shutil
+    return bool(os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang"))
+
+
+def exact_block_sparse(q_windows, k_windows, v_windows, block_mask, *, ensure_nonempty=False, block_m=None):
+    """The stream's block-sparse attention in plain torch — the same softmax over the same keys as
+    FlashVSR+'s Triton kernel and its eager reference (checked: max |Δ| 0.002 in bf16, M5 05.11).
+    Layout of the model's stream: q[B,H,Qb,T,D], k/v[B,H,Kb,T,D], block_mask[B,H,Qb,Kb]. Per query
+    block: gather the union of allowed key blocks, SDPA with the per-head token mask (None when
+    every head allows every gathered block, so the fused kernels apply)."""
+    import torch
+    import torch.nn.functional as F
+    B, H, Qb, T, D = q_windows.shape
+    flat = block_mask.bool().reshape(B * H, Qb, -1).clone()
+    empty = ~flat.any(dim=-1)
+    rows = torch.arange(Qb, device=flat.device)
+    cols = rows.clamp_max(max(flat.shape[-1] - 1, 0))
+    eb, er = torch.where(empty)
+    flat[eb, er, cols[er]] = True   # an empty row attends to its own block (as the reference)
+    bm = flat.reshape(B, H, Qb, -1)
+    any_bh = bm.any(dim=0).any(dim=0)
+    out = torch.empty_like(q_windows)
+    for qb in range(Qb):
+        sel = torch.nonzero(any_bh[qb], as_tuple=False).flatten()
+        n = sel.numel()
+        k = k_windows.index_select(2, sel).reshape(B, H, n * T, D)
+        v = v_windows.index_select(2, sel).reshape(B, H, n * T, D)
+        m = bm[:, :, qb].index_select(2, sel)
+        mask = None if bool(m.all()) else m.repeat_interleave(T, dim=-1)[:, :, None, :]
+        out[:, :, qb] = F.scaled_dot_product_attention(q_windows[:, :, qb], k, v, attn_mask=mask)
+    return out
+
+
 def _pipeline(mode: str, decode_every: int):
     key = (mode, decode_every)
     if key in _CACHE:
         return _CACHE[key]
     _paths()
+    import models.attention as MA
+    if not _triton_can_build():
+        MA.stream_block_sparse_attention = exact_block_sparse
     import torch
     from pathlib import Path
     from inference import build_inference_pipeline
@@ -132,6 +172,7 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
     finally:
         stream.close()
     torch.cuda.synchronize()
-    return {"engine": f"flashvsr-{mode}", "model_w": OW, "model_h": OH, "frames_out": out["frames"],
+    return {"engine": f"flashvsr-{mode}", "attn": "triton" if _triton_can_build() else "torch",
+            "model_w": OW, "model_h": OH, "frames_out": out["frames"],
             "model_s": round(time.time() - t0, 1),
             "peak_gib": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)}
