@@ -138,6 +138,34 @@ jobs:
           assert d < 0.02, d  # bf16 rounding; M5 GPU measured 0.002
           EOF
 
+      # Triton builds its CUDA driver module and a launcher per kernel with a C compiler at first
+      # use; the runtime base has none (05.11), and with the exact torch path the model ran ~5×
+      # slower than its own kernel (RTX 4090, 1080p: 1.20 s per frame). A conda-forge gcc with its
+      # OWN sysroot under /opt/cc: nothing in the image's system libraries changes.
+      - name: Toolchain layer (conda-forge gcc, own sysroot)
+        run: |
+          set -eu
+          curl -fsSL https://micro.mamba.pm/api/micromamba/linux-64/2.3.3 | tar -xj -C /tmp bin/micromamba
+          sudo mkdir -p /opt/cc && sudo chown "$USER" /opt/cc
+          /tmp/bin/micromamba create -y -q -p /opt/cc -c conda-forge --override-channels "gcc_linux-64=13.*"
+          /opt/cc/bin/x86_64-conda-linux-gnu-gcc --version | head -1
+          # Prove it builds what Triton builds: its own driver.c into a Python extension linked
+          # with -lcuda (a stub here; the card's libcuda.so.1 on the worker).
+          mkdir -p /tmp/stub /tmp/drv
+          printf 'int cuInit(unsigned f){return 0;}\n' > /tmp/stub/c.c
+          /opt/cc/bin/x86_64-conda-linux-gnu-gcc -shared -fPIC /tmp/stub/c.c -o /tmp/stub/libcuda.so
+          CC=/opt/cc/bin/x86_64-conda-linux-gnu-gcc python - <<'EOF'
+          import os, shutil, triton
+          from triton.runtime.build import _build
+          from triton.backends.nvidia.driver import include_dir
+          src = os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "driver.c")
+          shutil.copy(src, "/tmp/drv/driver.c")
+          so = _build("cuda_utils", "/tmp/drv/driver.c", "/tmp/drv", ["/tmp/stub"], include_dir, ["cuda"])
+          print("triton driver module built with the layer's gcc:", so, os.path.getsize(so))
+          EOF
+          mkdir -p l5/opt && cp -a /opt/cc l5/opt/cc
+          du -sh l5
+
       - uses: imjasonh/setup-crane@v0.4
 
       - name: Append onto the production image
@@ -148,10 +176,11 @@ jobs:
           tar -C l1 --owner=0 --group=0 -cf l1.tar opt
           tar -C l2 --owner=0 --group=0 -cf l2.tar opt
           tar -C l3 --owner=0 --group=0 -cf l3.tar opt
+          tar -C l5 --owner=0 --group=0 -cf l5.tar opt
           mkdir -p l4 && cp handler.py flashvsr_engine.py l4/
           tar -C l4 --owner=0 --group=0 -cf l4.tar handler.py flashvsr_engine.py
           NEW="ghcr.io/${{ github.repository_owner }}/timbrica-video-upscale-worker:flashvsr-${{ github.sha }}"
-          crane append -b "${{ inputs.base }}" -f l1.tar -f l2.tar -f l3.tar -f l4.tar -t "$NEW"
+          crane append -b "${{ inputs.base }}" -f l1.tar -f l2.tar -f l3.tar -f l5.tar -f l4.tar -t "$NEW"
           echo "pin this in RunPod: ghcr.io/${{ github.repository_owner }}/timbrica-video-upscale-worker@$(crane digest "$NEW")"
           crane export "$NEW" - | tar -xO handler.py | sha256sum
           sha256sum handler.py
