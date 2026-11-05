@@ -1,0 +1,111 @@
+name: patch-flashvsr
+
+# The restoration engine (FlashVSR+ Turbo) as LAYERS on the image production already runs —
+# same rule as patch.yml: no rebuild, the ESRGAN runtime stays byte-for-byte what it was
+# (a rebuild of the same commit resolves dozens of different packages, measured 2026-11-04).
+#
+# Three layers, appended registry-side (`crane append`, base layers never downloaded):
+#   1. /opt/flashvsr      — FlashVSR+ inference code at a PINNED commit (Apache-2.0) + its
+#                           Triton stream attention (operators/flashvsr_attn);
+#   2. /opt/pydeps        — the pure-Python deps the base lacks (einops, imageio, safetensors
+#                           wheel for cp311/manylinux), imported via sys.path in the engine;
+#   3. /opt/flashvsr/ckpts — Turbo weights stored in bf16 (the loader casts to bf16 anyway:
+#                           lossless for inference, half the bytes for every cold start),
+#                           sha256 of the fp32 originals checked against the values below.
+#   + handler.py and flashvsr_engine.py on top.
+# Triton itself ships inside the base's torch 2.7.1 wheel (3.3.x: sm_89 and sm_120).
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "The image production runs: ghcr.io/…/timbrica-video-upscale-worker@sha256:…"
+        required: true
+
+env:
+  FLASHVSR_COMMIT: b548a2cc2c929d3d4676f2973abe27876ec4dee7
+  HF_REPO: ruchangyao/FlashVSR_plus
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Delivery self-check
+        run: python3 delivery_selftest.py
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Code layer (pinned FlashVSR+)
+        run: |
+          set -eu
+          mkdir -p l1/opt
+          curl -fsSL "https://github.com/OpenImagingLab/FlashVSR_Plus/archive/${FLASHVSR_COMMIT}.tar.gz" | tar -xz -C l1/opt
+          mv "l1/opt/FlashVSR_Plus-${FLASHVSR_COMMIT}" l1/opt/flashvsr
+          rm -rf l1/opt/flashvsr/assets l1/opt/flashvsr/examples l1/opt/flashvsr/ckpts
+          test -f l1/opt/flashvsr/prompt_tensor/posi_prompt.pth
+          test -f l1/opt/flashvsr/operators/flashvsr_attn/flashvsr_attn/__init__.py
+
+      - name: Python deps layer (cp311 manylinux, no torch)
+        run: |
+          set -eu
+          mkdir -p l2/opt/pydeps
+          python -m pip install --no-deps --only-binary=:all: --platform manylinux2014_x86_64 \
+            --python-version 3.11 --implementation cp --target l2/opt/pydeps \
+            "einops==0.8.1" "imageio==2.37.0" "imageio-ffmpeg==0.6.0" "tqdm==4.67.1" "safetensors==0.5.3"
+          cp -r l1/opt/flashvsr/operators/flashvsr_attn/flashvsr_attn l2/opt/pydeps/flashvsr_attn
+          ls l2/opt/pydeps
+
+      - name: Weights layer (Turbo, bf16)
+        run: |
+          set -eu
+          python -m pip install --quiet torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --quiet "safetensors==0.5.3" "huggingface_hub>=0.28"
+          python - <<'EOF'
+          import hashlib, os
+          import torch
+          from huggingface_hub import hf_hub_download
+          from safetensors.torch import load_file, save_file
+          out = "l3/opt/flashvsr/ckpts"
+          os.makedirs(out + "/turbo", exist_ok=True)
+          for f in ["turbo/dit.safetensors", "turbo/lq_proj_in.safetensors"]:
+              p = hf_hub_download(os.environ["HF_REPO"], f)
+              sd = load_file(p)
+              save_file({k: (v.to(torch.bfloat16) if v.is_floating_point() else v) for k, v in sd.items()}, f"{out}/{f}")
+              print(f, os.path.getsize(p), "->", os.path.getsize(f"{out}/{f}"))
+              os.remove(p)
+          p = hf_hub_download(os.environ["HF_REPO"], "TCDecoder.ckpt")
+          os.replace(p, f"{out}/TCDecoder.ckpt")
+          EOF
+          du -sh l3
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Append onto the production image
+        run: |
+          set -eu
+          case "${{ inputs.base }}" in *@sha256:*) ;; *) echo "base must be a DIGEST, not a tag"; exit 1;; esac
+          crane auth login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+          tar -C l1 --owner=0 --group=0 -cf l1.tar opt
+          tar -C l2 --owner=0 --group=0 -cf l2.tar opt
+          tar -C l3 --owner=0 --group=0 -cf l3.tar opt
+          mkdir -p l4 && cp handler.py flashvsr_engine.py l4/
+          tar -C l4 --owner=0 --group=0 -cf l4.tar handler.py flashvsr_engine.py
+          NEW="ghcr.io/${{ github.repository_owner }}/timbrica-video-upscale-worker:flashvsr-${{ github.sha }}"
+          crane append -b "${{ inputs.base }}" -f l1.tar -f l2.tar -f l3.tar -f l4.tar -t "$NEW"
+          echo "pin this in RunPod: ghcr.io/${{ github.repository_owner }}/timbrica-video-upscale-worker@$(crane digest "$NEW")"
+          crane export "$NEW" - | tar -xO handler.py | sha256sum
+          sha256sum handler.py
+          crane export "$NEW" - | tar -xO flashvsr_engine.py | sha256sum
+          sha256sum flashvsr_engine.py

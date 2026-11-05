@@ -8,7 +8,9 @@ only, RunPod caps request bodies at 10 MiB):
     "out_url": signed PUT  → where to upload the result mp4 (in PARTS, below),
     "scale": 2 | 4,
     "out_w", "out_h": int,         # optional: the page's size box (see _target_dims)
-    "model": "general-x4v3" | "x4plus",
+    "model": "general-x4v3" | "x4plus" | "flashvsr-turbo",
+                                   # flashvsr-*: the restoration ENGINE (flashvsr_engine.py) —
+                                   # a stream model that runs AT the box, not ×4-then-reduce
     "cq": 19,                      # NVENC constant-quality target
     "max_bps": int,                # bitrate ceiling → -maxrate (result-size bound)
     "part_bytes": int,             # size of one result part (server's proxy floor)
@@ -68,6 +70,12 @@ MODELS = {
     "general-x4v3": ("realesr-general-x4v3.pth", 4, True),
     "x4plus": ("RealESRGAN_x4plus.pth", 4, False),
 }
+# Stream engines: not per-frame networks but whole-video models with their own runner.
+# key -> (module, mode). The module ships as its own image layer (patch-flashvsr.yml).
+ENGINES = {
+    "flashvsr-turbo": ("flashvsr_engine", "turbo"),
+}
+ENGINE_MAX_SHORT = 2160
 WEIGHTS_DIR = os.environ.get("WEIGHTS_DIR", "/weights")
 DEFAULT_PART_BYTES = 48 * 1024 * 1024
 
@@ -789,7 +797,8 @@ def _handle(job):
     if not in_url or not out_url:
         return {"error": "missing_urls"}
     scale = 2 if int(inp.get("scale", 2)) == 2 else 4
-    model_key = inp.get("model") if inp.get("model") in MODELS else "general-x4v3"
+    model_key = inp.get("model") if (inp.get("model") in MODELS or inp.get("model") in ENGINES) else "general-x4v3"
+    engine = ENGINES.get(model_key)
     cq = max(10, min(35, int(inp.get("cq", 19))))
     billed_s = int(inp.get("billed_duration_s", 0))
     billed_h = int(inp.get("billed_h", 0))
@@ -833,7 +842,12 @@ def _handle(job):
     if max(ow, oh) > HEVC_MAX_PX:
         return {"error": "output_dims_unsupported", "out_w": ow, "out_h": oh}
 
-    upsampler = _build_upsampler(model_key)
+    # The restoration engine is proven untiled up to 4K on 24 GB (its authors' claim, the
+    # web tier sells no more): refuse past it BEFORE any GPU spend, as the HEVC wall above.
+    if engine and min(ow, oh) > ENGINE_MAX_SHORT:
+        return {"error": "engine_out_too_big", "out_w": ow, "out_h": oh, "model": model_key}
+
+    upsampler = None if engine else _build_upsampler(model_key)
     encoder = _pick_encoder(ow, oh)
 
     # The fps filter pins the pipe to the SAME rate the encoder stamps.
@@ -879,27 +893,41 @@ def _handle(job):
         enc_err_f.close()  # the child holds its own copy of the fd
 
     frame_bytes = w * h * 3
-    frames = 0
+    counts = {"frames": 0, "last_pct": -1}
     gpu_ms = 0.0
-    last_pct = -1
-    try:
+    engine_facts = {}
+
+    def source_frames():
         while True:
             raw = dec.stdout.read(frame_bytes)
             if not raw or len(raw) < frame_bytes:
-                break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
+                return
+            yield np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
+
+    def emit(out_img):
+        enc.stdin.write(np.ascontiguousarray(out_img).tobytes())
+        counts["frames"] += 1
+        n = counts["frames"]
+        pct = 3 + int(93 * n / max(n, total_frames))
+        if pct != counts["last_pct"] and (n % 15 == 0 or pct >= 96):
+            counts["last_pct"] = pct
+            _progress(job, {"pct": min(96, pct), "stage": "upscale"})
+
+    try:
+        if engine:
+            import importlib
+            mod = importlib.import_module(engine[0])
             g0 = time.time()
-            # ×4 down to the box: area averaging is the reduction that does not
-            # alias fine detail the model just made (on the card, _frame_bgr).
-            out_img = _frame_bgr(upsampler, frame, ow, oh, bool(target), scale)
-            gpu_ms += (time.time() - g0) * 1000
-            enc.stdin.write(np.ascontiguousarray(out_img).tobytes())
-            frames += 1
-            pct = 3 + int(93 * frames / max(frames, total_frames))
-            if pct != last_pct and (frames % 15 == 0 or pct >= 96):
-                last_pct = pct
-                _progress(
-                    job, {"pct": min(96, pct), "stage": "upscale"})
+            engine_facts = mod.upscale_stream(source_frames(), w, h, ow, oh, emit, mode=engine[1])
+            gpu_ms = (time.time() - g0) * 1000
+        else:
+            for frame in source_frames():
+                g0 = time.time()
+                # ×4 down to the box: area averaging is the reduction that does not
+                # alias fine detail the model just made (on the card, _frame_bgr).
+                out_img = _frame_bgr(upsampler, frame, ow, oh, bool(target), scale)
+                gpu_ms += (time.time() - g0) * 1000
+                emit(out_img)
     except BrokenPipeError:
         # The encoder died under us — its stderr has the real reason (NVENC
         # session-open refusals land here: the write, not the spawn, fails).
@@ -908,13 +936,14 @@ def _handle(job):
         except Exception:
             pass
         return {"error": f"encode_failed:{encoder}:{_gpu_name()}:{_tail(enc_log, 180)}",
-                "frames": frames, "encoder": encoder, "gpu": _gpu_name()}
+                "frames": counts["frames"], "encoder": encoder, "gpu": _gpu_name()}
     except Exception as e:
         try:
             dec.kill(); enc.kill()
         except Exception:
             pass
-        return {"error": f"upscale_failed:{type(e).__name__}", "frames": frames}
+        return {"error": f"upscale_failed:{type(e).__name__}", "frames": counts["frames"],
+                "model": model_key, "gpu": _gpu_name(), "detail": str(e)[:200]}
     finally:
         try:
             dec.stdout.close()
@@ -933,6 +962,7 @@ def _handle(job):
     if enc.wait(timeout=1800) != 0:
         return {"error": f"encode_failed:{encoder}:{_gpu_name()}:{_tail(enc_log, 180)}",
                 "encoder": encoder, "gpu": _gpu_name()}
+    frames = counts["frames"]
     if frames == 0 or not os.path.exists(dst) or os.path.getsize(dst) < 4096:
         return {"error": "empty_output", "frames": frames}
 
@@ -962,6 +992,7 @@ def _handle(job):
         "delivery_tries": sent.get("delivery_tries", 0), "delivery_s": sent.get("delivery_s", 0),
         "nvenc_lib": _nvenc_lib(),
         "post_on_card": _POST_ON_CARD["ok"], "post_fallback": _POST_ON_CARD["fallback"] or None,
+        "engine": engine_facts or None,
         "encoder_probe_err": {k: v[-160:] for k, v in _ENC_PROBE_ERRORS.items()} if encoder == "libx264" else None,
         **_mem_facts(),
     }

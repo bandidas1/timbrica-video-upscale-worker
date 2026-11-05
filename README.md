@@ -39,3 +39,25 @@ worker building itself, not a shortage of GPUs. With `idleTimeout: 5 s` on a
 lane that sees roughly one job a day, essentially every real job pays it.
 
 Building from this Dockerfile replaces all of that with an image pull.
+
+## Engines (2026-11-05): `input.model` picks one
+
+| model | engine | runs at | cost grows with |
+|---|---|---|---|
+| `general-x4v3` (default), `x4plus` | Real-ESRGAN per frame (`_frame_bgr`) | ×4, then area-reduced to the box | input pixels |
+| `flashvsr-turbo` | FlashVSR+ Turbo stream (`flashvsr_engine.py`) | the box itself (padded to 128 by reflection, cropped back) | output pixels |
+
+FlashVSR+ (OpenImagingLab, Apache-2.0; Wan2.1-1.3B, Apache-2.0) is a one-step diffusion video
+super-resolution model: frames go through its own stream runner (bounded KV cache across frames,
+colour corrected per decode segment), so the decoder → model → encoder pipes and the delivery are
+the same as for Real-ESRGAN. It refuses an output above 2160 on the short side before any GPU
+spend (`engine_out_too_big`). Why it is here and the bench behind it — the site repo,
+`docs/why/video-upscaler-restoration-engine.md`.
+
+It ships as LAYERS on the production digest, not a rebuild (`patch-flashvsr.yml`): pinned
+FlashVSR+ code in `/opt/flashvsr`, its Triton stream attention + pure-Python deps in
+`/opt/pydeps` (appended to `sys.path`, nothing in the base shadowed), Turbo weights stored bf16
+in `/opt/flashvsr/ckpts`, then `handler.py` + `flashvsr_engine.py`. Triton comes with the base's
+torch 2.7.1. Checked before shipping: the real `_handle()` with `flashvsr-turbo` on an RTX 4060
+(CUDA, the model's Triton kernel, NVENC) — 160×90 → 640×360, 30 frames in, 30 out, audio kept,
+peak 4.1 GiB.
