@@ -755,18 +755,40 @@ def _bench_engine(cfg: dict) -> dict:
                          capture_output=True, timeout=120).stdout
     frames = [np.frombuffer(raw[i * w * h * 3:(i + 1) * w * h * 3], dtype=np.uint8).reshape(h, w, 3) for i in range(n)]
     mod = importlib.import_module(ENGINES[key][0])
-    passes = []
-    for _ in range(2):
-        got = {"n": 0}
-        t = time.time()
-        facts = mod.upscale_stream(iter(frames), w, h, ow, oh, lambda f: got.__setitem__("n", got["n"] + 1), mode=ENGINES[key][1])
-        passes.append({"s": round(time.time() - t, 2), "frames_out": got["n"], **facts})
-    warm = passes[-1]
     mpx = ow * oh / 1e6
+    # "variants": knob sets A/B'd on THIS host, in the given order (list the baseline again at
+    # the end to see drift). The first variant's frames are the reference the others are
+    # compared to — a knob that changes the picture beyond rounding is not a speed knob.
+    variants = cfg.get("variants") or [{}]
+    defaults = dict(mod.KNOBS)
+    ref, warm_key, passes = None, None, []
+    try:
+        for var in variants:
+            mod.KNOBS.update(defaults)
+            mod.KNOBS.update({k: v for k, v in var.items() if k in defaults})
+            de = int(var.get("decode_every", 8))
+            for _ in range(1 if warm_key == de else 2):   # a new pipeline warms first
+                kept = []
+                t = time.time()
+                facts = mod.upscale_stream(iter(frames), w, h, ow, oh, kept.append, mode=ENGINES[key][1], decode_every=de)
+                s = time.time() - t
+            warm_key = de
+            row = {"variant": var, "s": round(s, 2), "s_per_out_mpx_frame": round(s / max(1, len(kept)) / mpx, 4), **facts}
+            if ref is None:
+                ref = kept
+            elif len(kept) == len(ref):
+                mx, mean = 0, 0.0
+                for a, b in zip(kept, ref):
+                    x = np.abs(a.astype(np.int16) - b.astype(np.int16))
+                    mx, mean = max(mx, int(x.max())), mean + float(x.mean()) / len(ref)
+                row["vs_first"] = {"max": mx, "mean": round(mean, 4)}
+            passes.append(row)
+    finally:
+        mod.KNOBS.update(defaults)
     return {"bench_engine": True, "model": key, "gpu": _gpu_name(), "driver": _driver_version(),
             "src": f"{w}x{h}", "box": f"{ow}x{oh}", "frames": n, "passes": passes,
-            "s_per_frame": round(warm["s"] / max(1, warm["frames_out"]), 4),
-            "s_per_out_mpx_frame": round(warm["s"] / max(1, warm["frames_out"]) / mpx, 4), **_mem_facts()}
+            "s_per_frame": round(passes[0]["s"] / max(1, passes[0]["frames_out"]), 4),
+            "s_per_out_mpx_frame": passes[0]["s_per_out_mpx_frame"], **_mem_facts()}
 
 
 def _encoder_probe_report() -> dict:

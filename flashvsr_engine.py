@@ -17,6 +17,8 @@ LQ frames are bicubic-resized (PIL, a=-0.5) to the target and scaled to [-1, 1];
 multiples of 128 — we pad bottom/right by reflection and crop the output back, so no pixel of
 the picture is cropped or stretched beyond the box rounding the ESRGAN path already does.
 """
+import contextlib
+import functools
 import os
 import sys
 import time
@@ -29,6 +31,130 @@ FVP_DIR = os.environ.get("FLASHVSR_DIR", "/opt/flashvsr")
 PYDEPS = os.environ.get("FLASHVSR_PYDEPS", "/opt/pydeps")
 MULT = 128
 _CACHE = {}
+
+# Knobs a probe A/B's on ONE pool host (bench_engine "variants" — hosts differ, so only a pair on
+# the same host is a measurement); a job runs the defaults. A knob earns its default by such a
+# probe, never by reasoning — docs/why/video-upscaler-restoration-engine.md keeps the numbers.
+#   threads       — torch intra-op threads; "quota" = the pod's cgroup CPU quota. A pod sees the
+#                   host's 128–256 cores but may use 4: pools sized by the visible count thrash
+#                   (the ESRGAN post took 1238 ms/frame on such a host, 04.11).
+#   color_on_card — the wavelet color correction on the card instead of the host CPU (the
+#                   model's decoder hands its frames back on the CPU).
+#   keep_dit      — keep the 1.3B DiT on the card while the decoder runs (the model moves it to
+#                   the host and back every segment to fit 24 GB at 4K).
+KNOBS = {"threads": None, "color_on_card": False, "keep_dit": False}
+_PH = {"cur": None, "stack": []}
+
+
+def cpu_quota():
+    """vCPUs the container may actually use (cgroup v2 cpu.max, else v1 CFS); None = no quota."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            q, p = fh.read().split()[:2]
+        if q != "max":
+            return max(1, round(int(q) / int(p)))
+        return None
+    except Exception:
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as fh:
+            q = int(fh.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
+            p = int(fh.read())
+        return max(1, round(q / p)) if q > 0 else None
+    except Exception:
+        return None
+
+
+_THREADS0 = {}
+
+
+def _apply_threads():
+    """The knob's thread count, or torch's own default back (a probe runs variants in one process)."""
+    import torch
+    _THREADS0.setdefault("n", torch.get_num_threads())
+    want = KNOBS["threads"]
+    if want == "quota":
+        want = cpu_quota()
+    want = int(want) if want else _THREADS0["n"]
+    if torch.get_num_threads() != want:
+        torch.set_num_threads(want)
+
+
+@contextlib.contextmanager
+def _phase(name: str):
+    """Exclusive wall time of a phase (a nested phase's time is not counted twice), the card
+    synchronized at both edges so GPU work lands in the phase that queued it. Off unless a
+    run collects (upscale_stream sets _PH["cur"]); a few syncs per 32-frame segment."""
+    cur = _PH["cur"]
+    if cur is None:
+        yield
+        return
+    import torch
+    torch.cuda.synchronize()
+    st = _PH["stack"]
+    st.append(0.0)
+    t = time.perf_counter()
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize()
+        el = time.perf_counter() - t
+        child = st.pop()
+        cur[name] = cur.get(name, 0.0) + el - child
+        if st:
+            st[-1] += el
+
+
+def _timed(name: str, fn):
+    if getattr(fn, "_tmb_phase", None):
+        return fn
+
+    @functools.wraps(fn)
+    def run(*a, **k):
+        with _phase(name):
+            return fn(*a, **k)
+    run._tmb_phase = name
+    return run
+
+
+def _instrument(pipe):
+    """Phase timers on the model's own seams + the knobs' switches. The model's code is not
+    edited (it is a pinned upstream commit); its module attributes are wrapped once."""
+    import torch
+    import inference.runners.stream as RS
+    from inference.postprocessing.color_correction import WaveletColorCorrector
+
+    if not getattr(RS, "_tmb_instrumented", False):
+        off, back = RS._offload_dit, RS._restore_dit
+
+        def offload(bundle, state, device):
+            if not KNOBS["keep_dit"]:
+                off(bundle, state, device)
+
+        def restore(bundle, state, device):
+            if not KNOBS["keep_dit"]:
+                back(bundle, state, device)
+
+        class CardColor(WaveletColorCorrector):
+            def __call__(self, generated, reference):
+                with _phase("color"):
+                    if KNOBS["color_on_card"] and generated.device.type != "cuda":
+                        try:
+                            return super().__call__(generated.to("cuda"), reference)
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                    return super().__call__(generated, reference)
+
+        RS._offload_dit = _timed("offload", offload)
+        RS._restore_dit = _timed("restore", restore)
+        RS._merge_segment_groups = _timed("merge", RS._merge_segment_groups)
+        RS.WaveletColorCorrector = CardColor
+        RS._tmb_instrumented = True
+    b = pipe.bundle
+    b.decoder.decode_stream_segment = _timed("decode", b.decoder.decode_stream_segment)
+    b.denoiser.forward_stream = _timed("dit", b.denoiser.forward_stream)
+    pipe.runner._project_lq_chunk = _timed("proj", pipe.runner._project_lq_chunk)
 
 
 def model_dims(ow: int, oh: int) -> tuple:
@@ -166,6 +292,7 @@ def _pipeline(mode: str, decode_every: int):
     _CACHE.clear()  # one engine resident: the card holds one 1.3B model, not two
     torch.cuda.empty_cache()
     pipe = build_inference_pipeline(config, paths)
+    _instrument(pipe)
     _CACHE[key] = pipe
     return pipe
 
@@ -182,6 +309,7 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
     from inference.config import TEMPORAL_DOWNSAMPLE
 
     pipe = _pipeline(mode, decode_every)
+    _apply_threads()
     OW, OH = model_dims(ow, oh)
     tc = pipe.config.temporal_compression
     chunk = decode_every * tc
@@ -189,17 +317,28 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
     def lq_chunks():
         buf = []
         first = True
-        for bgr in frames:
-            rgb = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
-            if (w, h) != (ow, oh):
-                rgb = rgb.resize((ow, oh), Image.Resampling.BICUBIC)
-            buf.append(np.asarray(rgb))
-            need = chunk + 1 if first else chunk
-            if len(buf) >= need:
-                yield _to_tensor(buf)
-                buf, first = [], False
+        src = iter(frames)
+        while True:
+            with _phase("src"):   # the caller's decoder (ffmpeg pipe in a job)
+                bgr = next(src, None)
+            if bgr is None:
+                break
+            with _phase("prep"):
+                rgb = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
+                if (w, h) != (ow, oh):
+                    rgb = rgb.resize((ow, oh), Image.Resampling.BICUBIC)
+                buf.append(np.asarray(rgb))
+                need = chunk + 1 if first else chunk
+                ready = len(buf) >= need
+                if ready:
+                    t = _to_tensor(buf)
+                    buf, first = [], False
+            if ready:
+                yield t
         if buf:
-            yield _to_tensor(buf)
+            with _phase("prep"):
+                t = _to_tensor(buf)
+            yield t
 
     def _to_tensor(buf):
         t = torch.from_numpy(np.stack(buf)).permute(0, 3, 1, 2).float().div_(127.5).sub_(1.0)  # F,3,oh,ow
@@ -211,29 +350,39 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
 
     class _Writer:
         def append(self, video, *, value_range="neg_one_to_one"):
-            v = video[0, :, :, :oh, :ow]  # 3,F,oh,ow on the card
-            if stream.eof:  # the runner already cuts the EOF padding; never emit past the source
-                v = v[:, :max(0, stream.source_frames - out["frames"])]
-            v = v.float().add_(1.0).mul_(127.5).clamp_(0, 255).round_().to(torch.uint8)
-            v = v[[2, 1, 0]].permute(1, 2, 3, 0).contiguous().cpu().numpy()  # F,oh,ow,3 BGR
-            for f in v:
-                emit(f)
-                out["frames"] += 1
-            if on_progress:
-                on_progress(out["frames"])
+            with _phase("write"):
+                v = video[0, :, :, :oh, :ow]  # 3,F,oh,ow — on the card or the host, per the color knob
+                if stream.eof:  # the runner already cuts the EOF padding; never emit past the source
+                    v = v[:, :max(0, stream.source_frames - out["frames"])]
+                v = v.float().add_(1.0).mul_(127.5).clamp_(0, 255).round_().to(torch.uint8)
+                v = v[[2, 1, 0]].permute(1, 2, 3, 0).contiguous().cpu().numpy()  # F,oh,ow,3 BGR
+            with _phase("emit"):  # the caller's encoder pipe (blocks when the encoder lags)
+                for f in v:
+                    emit(f)
+                    out["frames"] += 1
+                if on_progress:
+                    on_progress(out["frames"])
 
         def close(self):
             pass
 
     stream = TemporalVideoStream(lq_chunks(), tc, TEMPORAL_DOWNSAMPLE)
     torch.cuda.reset_peak_memory_stats()
+    phases = {}
+    _PH.update(cur=phases, stack=[])
     t0 = time.time()
     try:
         pipe.runner.run(stream, None, progress=None, segment_writer=_Writer(), output_frame_limit=None)
     finally:
+        _PH.update(cur=None, stack=[])
         stream.close()
     torch.cuda.synchronize()
+    total = time.time() - t0
+    phases["other"] = total - sum(phases.values())
     return {"engine": f"flashvsr-{mode}", "attn": ATTN["kind"], "attn_why": ATTN["why"],
             "model_w": OW, "model_h": OH, "frames_out": out["frames"],
-            "model_s": round(time.time() - t0, 1),
+            "model_s": round(total, 1),
+            "phases_s": {k: round(v, 2) for k, v in sorted(phases.items(), key=lambda kv: -kv[1])},
+            "threads": torch.get_num_threads(), "cpu_quota": cpu_quota(),
+            "knobs": dict(KNOBS), "decode_every": decode_every,
             "peak_gib": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)}
