@@ -47,12 +47,74 @@ def _paths():
         sys.path.append(PYDEPS)
 
 
+# A self-contained C toolchain (conda-forge gcc with its own sysroot) shipped as a layer: Triton
+# builds its CUDA driver module and a launcher per kernel with a C compiler at first use, and
+# the worker's runtime base has none (05.11 «Failed to find C compiler»). Its own sysroot means
+# the image's system libraries are not touched — the ESRGAN runtime stays what it was.
+CC_PATH = os.environ.get("FLASHVSR_CC", "/opt/cc/bin/x86_64-conda-linux-gnu-gcc")
+ATTN = {"kind": None, "why": ""}
+
+
+def _toolchain():
+    """CC for Triton, and a directory where `-lcuda` links: Triton passes -L<dir of libcuda.so.1>
+    and -lcuda, and the container carries only the versioned libcuda.so.1."""
+    if not os.environ.get("CC") and os.path.exists(CC_PATH):
+        os.environ["CC"] = CC_PATH
+    if os.environ.get("TRITON_LIBCUDA_PATH"):
+        return
+    try:
+        import subprocess
+        out = subprocess.check_output(["/sbin/ldconfig", "-p"], text=True)
+        locs = [ln.split()[-1] for ln in out.splitlines() if "libcuda.so.1" in ln]
+        if not locs:
+            return
+        d = "/tmp/tmb-libcuda"
+        os.makedirs(d, exist_ok=True)
+        for name in ("libcuda.so.1", "libcuda.so"):
+            p = os.path.join(d, name)
+            if not os.path.lexists(p):
+                os.symlink(locs[0], p)
+        os.environ["TRITON_LIBCUDA_PATH"] = d
+    except Exception:
+        pass
+
+
 def _triton_can_build() -> bool:
-    """Triton compiles a small C launcher per kernel (and its CUDA driver module) with the system
-    C compiler at first use. The worker's runtime base has none — the first pool card answered
-    «Failed to find C compiler» (05.11). Without one the stream attention runs exact_block_sparse."""
     import shutil
     return bool(os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang"))
+
+
+def _choose_attention(MA):
+    """The model's Triton stream kernel if it BUILDS here and answers like the exact path on a
+    known input (the OrtEpVerify rule: a kernel is trusted by its answer, not by its creation);
+    otherwise exact_block_sparse. Decided once per process; the job record says which and why."""
+    if ATTN["kind"]:
+        return
+    import torch
+    triton_fn = MA.stream_block_sparse_attention
+    _toolchain()
+    if triton_fn is None or not _triton_can_build():
+        MA.stream_block_sparse_attention = exact_block_sparse
+        ATTN.update(kind="torch", why="no kernel" if triton_fn is None else "no C compiler")
+        return
+    try:
+        g = torch.Generator(device="cuda").manual_seed(0)
+        bf = torch.bfloat16
+        q = torch.randn(1, 2, 4, 128, 128, device="cuda", dtype=bf, generator=g)
+        k = torch.randn(1, 2, 7, 128, 128, device="cuda", dtype=bf, generator=g)
+        v = torch.randn(1, 2, 7, 128, 128, device="cuda", dtype=bf, generator=g)
+        m = torch.rand(1, 2, 4, 7, device="cuda", generator=g) < 0.4
+        m[..., 0] = True
+        with torch.inference_mode():
+            d = (triton_fn(q, k, v, m).float() - exact_block_sparse(q, k, v, m).float()).abs().max().item()
+        if d < 0.05:
+            ATTN.update(kind="triton", why=f"verified max|d| {d:.4f}")
+        else:
+            MA.stream_block_sparse_attention = exact_block_sparse
+            ATTN.update(kind="torch", why=f"triton answered wrong: max|d| {d:.4f}")
+    except Exception as e:  # noqa: BLE001 — a kernel that cannot build or launch must not fail a paid job
+        MA.stream_block_sparse_attention = exact_block_sparse
+        ATTN.update(kind="torch", why=f"triton failed: {type(e).__name__}: {str(e)[:160]}")
 
 
 def exact_block_sparse(q_windows, k_windows, v_windows, block_mask, *, ensure_nonempty=False, block_m=None):
@@ -90,8 +152,7 @@ def _pipeline(mode: str, decode_every: int):
         return _CACHE[key]
     _paths()
     import models.attention as MA
-    if not _triton_can_build():
-        MA.stream_block_sparse_attention = exact_block_sparse
+    _choose_attention(MA)
     import torch
     from pathlib import Path
     from inference import build_inference_pipeline
@@ -172,7 +233,7 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
     finally:
         stream.close()
     torch.cuda.synchronize()
-    return {"engine": f"flashvsr-{mode}", "attn": "triton" if _triton_can_build() else "torch",
+    return {"engine": f"flashvsr-{mode}", "attn": ATTN["kind"], "attn_why": ATTN["why"],
             "model_w": OW, "model_h": OH, "frames_out": out["frames"],
             "model_s": round(time.time() - t0, 1),
             "peak_gib": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)}

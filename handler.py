@@ -49,6 +49,11 @@ import time
 import urllib.error
 import urllib.request
 
+# Before torch ever initialises CUDA in this process: the restoration engine's 4K stream died on
+# a 24 GB card with 5.65 GiB «reserved but unallocated» (probe 05.11). Expandable segments change
+# where the allocator puts blocks, never a computed value — the ESRGAN frame stays byte-identical.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import cv2
 import numpy as np
 import runpod
