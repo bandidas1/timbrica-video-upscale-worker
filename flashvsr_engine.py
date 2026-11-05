@@ -20,7 +20,9 @@ the picture is cropped or stretched beyond the box rounding the ESRGAN path alre
 import contextlib
 import functools
 import os
+import queue
 import sys
+import threading
 import time
 
 import numpy as np
@@ -35,14 +37,19 @@ _CACHE = {}
 # Knobs a probe A/B's on ONE pool host (bench_engine "variants" — hosts differ, so only a pair on
 # the same host is a measurement); a job runs the defaults. A knob earns its default by such a
 # probe, never by reasoning — docs/why/video-upscaler-restoration-engine.md keeps the numbers.
-#   threads       — torch intra-op threads; "quota" = the pod's cgroup CPU quota. A pod sees the
-#                   host's 128–256 cores but may use 4: pools sized by the visible count thrash
-#                   (the ESRGAN post took 1238 ms/frame on such a host, 04.11).
-#   color_on_card — the wavelet color correction on the card instead of the host CPU (the
-#                   model's decoder hands its frames back on the CPU).
-#   keep_dit      — keep the 1.3B DiT on the card while the decoder runs (the model moves it to
-#                   the host and back every segment to fit 24 GB at 4K).
-KNOBS = {"threads": None, "color_on_card": False, "keep_dit": False}
+# Pool RTX 4090, 33 frames, every variant's frames identical to the baseline (max |diff| 0):
+#   1080p  baseline 32.4 s · color_on_card 21.9 · keep_dit 26.3 · both 14.6 (0.47 -> 0.21 s/MPx)
+#   1440p  baseline 55.3 s · color_on_card 36.3 · both 28.7 (0.45 -> 0.24 s/MPx), peak 13.9 -> 18.6 GiB
+#   color_on_card — the wavelet color correction on the card: the model's decoder hands its frames
+#                   back on the host, and the correction there took 10 s of 32 at 1080p.
+#   keep_dit      — leave the 1.3B DiT (and its attention cache) on the card while the decoder runs;
+#                   the model moves them to the host and back every segment so that 4K fits 24 GB
+#                   (6-8.5 s of a run). "auto" = keep up to the measured 1440p model area.
+#   prefetch      — LQ frames resized and packed in a background thread, one chunk ahead, so the
+#                   card does not wait for PIL (prep 4.6-6.6 s of 28.7 at 1440p).
+# (A thread-count knob was measured and dropped: the pool pod has no cgroup CPU quota, 64 threads.)
+KNOBS = {"color_on_card": True, "keep_dit": "auto", "prefetch": True}
+KEEP_DIT_MAX_AREA = 2560 * 1536   # model area of a 1440p box: peak 18.6 GiB on a 24 GB card
 _PH = {"cur": None, "stack": []}
 
 
@@ -66,19 +73,7 @@ def cpu_quota():
         return None
 
 
-_THREADS0 = {}
-
-
-def _apply_threads():
-    """The knob's thread count, or torch's own default back (a probe runs variants in one process)."""
-    import torch
-    _THREADS0.setdefault("n", torch.get_num_threads())
-    want = KNOBS["threads"]
-    if want == "quota":
-        want = cpu_quota()
-    want = int(want) if want else _THREADS0["n"]
-    if torch.get_num_threads() != want:
-        torch.set_num_threads(want)
+_RUN = {"keep_dit": False}   # the knobs resolved for the run in progress (the wrappers read it)
 
 
 @contextlib.contextmanager
@@ -129,11 +124,11 @@ def _instrument(pipe):
         off, back = RS._offload_dit, RS._restore_dit
 
         def offload(bundle, state, device):
-            if not KNOBS["keep_dit"]:
+            if not _RUN["keep_dit"]:
                 off(bundle, state, device)
 
         def restore(bundle, state, device):
-            if not KNOBS["keep_dit"]:
+            if not _RUN["keep_dit"]:
                 back(bundle, state, device)
 
         class CardColor(WaveletColorCorrector):
@@ -309,36 +304,86 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
     from inference.config import TEMPORAL_DOWNSAMPLE
 
     pipe = _pipeline(mode, decode_every)
-    _apply_threads()
     OW, OH = model_dims(ow, oh)
     tc = pipe.config.temporal_compression
     chunk = decode_every * tc
+    kd = KNOBS["keep_dit"]
+    _RUN["keep_dit"] = (OW * OH <= KEEP_DIT_MAX_AREA) if kd == "auto" else bool(kd)
+    lq_busy = {"src": 0.0, "prep": 0.0}   # producer time: on the critical path only without prefetch
 
     def lq_chunks():
+        """The model's LQ input: frames bicubic-resized (PIL, the model's own preprocessing) and
+        packed into chunks. Times itself without _phase — with prefetch it runs in another thread."""
         buf = []
         first = True
         src = iter(frames)
         while True:
-            with _phase("src"):   # the caller's decoder (ffmpeg pipe in a job)
-                bgr = next(src, None)
+            t = time.perf_counter()
+            bgr = next(src, None)   # the caller's decoder (ffmpeg pipe in a job)
+            lq_busy["src"] += time.perf_counter() - t
             if bgr is None:
                 break
-            with _phase("prep"):
-                rgb = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
-                if (w, h) != (ow, oh):
-                    rgb = rgb.resize((ow, oh), Image.Resampling.BICUBIC)
-                buf.append(np.asarray(rgb))
-                need = chunk + 1 if first else chunk
-                ready = len(buf) >= need
-                if ready:
-                    t = _to_tensor(buf)
-                    buf, first = [], False
+            t = time.perf_counter()
+            rgb = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
+            if (w, h) != (ow, oh):
+                rgb = rgb.resize((ow, oh), Image.Resampling.BICUBIC)
+            buf.append(np.asarray(rgb))
+            need = chunk + 1 if first else chunk
+            ready = len(buf) >= need
             if ready:
-                yield t
+                packed = _to_tensor(buf)
+                buf, first = [], False
+            lq_busy["prep"] += time.perf_counter() - t
+            if ready:
+                yield packed
         if buf:
-            with _phase("prep"):
-                t = _to_tensor(buf)
-            yield t
+            t = time.perf_counter()
+            packed = _to_tensor(buf)
+            lq_busy["prep"] += time.perf_counter() - t
+            yield packed
+
+    def prefetched(gen):
+        """`gen` one chunk ahead in a thread (PIL and the packing release the GIL), so the card
+        runs the previous chunk meanwhile. The consumer's wait is what still costs wall time
+        (wait_lq); an exception in the producer is raised here; leaving early stops it."""
+        q = queue.Queue(maxsize=1)
+        stop = threading.Event()
+        end = object()
+
+        def put(item):
+            while not stop.is_set():
+                try:
+                    q.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        def run():
+            try:
+                for item in gen:
+                    if not put(item):
+                        return
+                put(end)
+            except BaseException as e:  # noqa: BLE001 — handed to the consumer, raised there
+                put(e)
+            finally:
+                gen.close()
+
+        th = threading.Thread(target=run, name="flashvsr-lq-prefetch", daemon=True)
+        th.start()
+        try:
+            while True:
+                with _phase("wait_lq"):
+                    item = q.get()
+                if item is end:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stop.set()
+            th.join(timeout=30)
 
     def _to_tensor(buf):
         t = torch.from_numpy(np.stack(buf)).permute(0, 3, 1, 2).float().div_(127.5).sub_(1.0)  # F,3,oh,ow
@@ -366,23 +411,28 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
         def close(self):
             pass
 
-    stream = TemporalVideoStream(lq_chunks(), tc, TEMPORAL_DOWNSAMPLE)
+    prefetch = bool(KNOBS["prefetch"])
+    stream = TemporalVideoStream(prefetched(lq_chunks()) if prefetch else lq_chunks(), tc, TEMPORAL_DOWNSAMPLE)
     torch.cuda.reset_peak_memory_stats()
     phases = {}
     _PH.update(cur=phases, stack=[])
-    t0 = time.time()
+    t0 = time.perf_counter()   # the clock the phases use: wall time can be adjusted mid-run
     try:
         pipe.runner.run(stream, None, progress=None, segment_writer=_Writer(), output_frame_limit=None)
     finally:
         _PH.update(cur=None, stack=[])
         stream.close()
     torch.cuda.synchronize()
-    total = time.time() - t0
+    total = time.perf_counter() - t0
+    if not prefetch:   # on the critical path: part of the wall time (never nested in another phase)
+        phases.update(lq_busy)
     phases["other"] = total - sum(phases.values())
+    if prefetch:       # overlapped with the card: reported, not summed
+        phases.update({k + "_bg": v for k, v in lq_busy.items()})
     return {"engine": f"flashvsr-{mode}", "attn": ATTN["kind"], "attn_why": ATTN["why"],
             "model_w": OW, "model_h": OH, "frames_out": out["frames"],
             "model_s": round(total, 1),
             "phases_s": {k: round(v, 2) for k, v in sorted(phases.items(), key=lambda kv: -kv[1])},
             "threads": torch.get_num_threads(), "cpu_quota": cpu_quota(),
-            "knobs": dict(KNOBS), "decode_every": decode_every,
+            "knobs": dict(KNOBS), "keep_dit": _RUN["keep_dit"], "decode_every": decode_every,
             "peak_gib": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)}
