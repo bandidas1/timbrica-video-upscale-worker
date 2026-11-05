@@ -652,6 +652,12 @@ def _mem_facts() -> dict:
         facts["peak_rss_mb"] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
     except Exception:
         pass
+    try:  # the card's own memory tells a MIG slice from the whole card (same name for both)
+        import torch
+        if torch.cuda.is_available():
+            facts["gpu_mem_gb"] = round(torch.cuda.get_device_properties(0).total_memory / 2**30, 1)
+    except Exception:
+        pass
     return facts
 
 

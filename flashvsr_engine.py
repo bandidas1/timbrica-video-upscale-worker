@@ -46,9 +46,10 @@ _CACHE = {}
 #                   the model moves them to the host and back every segment so that 4K fits 24 GB
 #                   (6-8.5 s of a run). "auto" = keep up to the measured 1440p model area.
 #   prefetch      — LQ frames resized and packed in a background thread, one chunk ahead, so the
-#                   card does not wait for PIL (prep 4.6-6.6 s of 28.7 at 1440p).
+#                   card does not wait for PIL: 1440p, 97 frames, pool PRO 6000 73.4 -> 59.5 s.
+#   decode_on_card — the decoder's memory and output stay on the card (_segment_decoder); under test.
 # (A thread-count knob was measured and dropped: the pool pod has no cgroup CPU quota, 64 threads.)
-KNOBS = {"color_on_card": True, "keep_dit": "auto", "prefetch": True}
+KNOBS = {"color_on_card": True, "keep_dit": "auto", "prefetch": True, "decode_on_card": False}
 KEEP_DIT_MAX_AREA = 2560 * 1536   # model area of a 1440p box: peak 18.6 GiB on a 24 GB card
 _PH = {"cur": None, "stack": []}
 
@@ -113,6 +114,66 @@ def _timed(name: str, fn):
     return run
 
 
+def _segment_decoder(dec):
+    """TinyDecoder.decode_stream_segment, or — knob decode_on_card — the same steps with the
+    decoder's temporal memory and its output kept on the card. The model's adapter (pinned
+    b548a2cc, inference/decoders/tiny.py) moves the memory to the host and back around every
+    segment and every 4-latent output chunk to the host, then concatenates and rescales the
+    segment there in bf16: room for DiT on a 24 GB card at 4K. With the DiT kept (keep_dit) the
+    host trips are pure cost. Same candidates, same OOM fallback order, same arithmetic (×2 −1
+    in bf16 rounds the same on either device); the snapshot for an OOM retry is a card copy."""
+    import torch
+    orig = dec.decode_stream_segment
+
+    def chunks_on_card(latents, lq_video, *, device, dtype, use_parallel, first):
+        # TinyDecoder._decode_chunks minus the per-chunk copy to the host
+        outputs = []
+        for start in range(0, latents.shape[2], 4):
+            stop = min(start + 4, latents.shape[2])
+            cur = latents[:, :, start:stop].to(device=device, dtype=dtype)
+            if first and start == 0:
+                f0, n = 0, 4 * (stop - start) - 3
+            else:
+                f0, n = 4 * start - (3 if first else 0), 4 * (stop - start)
+            lq = lq_video[:, :, f0:f0 + n].to(device=device, dtype=dtype)
+            out = dec.module.decode_video(cur.transpose(1, 2), parallel=use_parallel,
+                                          show_progress_bar=False, cond=lq).transpose(1, 2)
+            outputs.append(out.detach())
+            del cur, lq, out
+        return torch.cat(outputs, dim=2)
+
+    def segment(latents, lq_video, *, first=False):
+        if not KNOBS["decode_on_card"]:
+            return orig(latents, lq_video, first=first)
+        from inference.decoders.base import DecodeResult
+        if first:
+            dec.reset()
+            dec.last_auto_fallbacks = 0
+        p = next(dec.module.parameters())
+        device, dtype = p.device, p.dtype
+        mode = dec.parallel_mode
+        cands = (dec._auto_candidates(lq_video, device) if mode == "auto"
+                 else [("parallel", True)] if mode == "parallel" else [("serial", False)])
+        saved = [None if x is None else x.detach().to(device).clone() for x in dec.module.mem]
+        for name, par in cands:
+            dec.module.mem = [None if x is None else x.clone() for x in saved]
+            try:
+                value = chunks_on_card(latents, lq_video, device=device, dtype=dtype,
+                                       use_parallel=par, first=first)
+            except torch.cuda.OutOfMemoryError:
+                dec.module.mem = saved
+                if mode != "auto" or name == "serial":
+                    raise
+                dec.last_auto_fallbacks += 1
+                torch.cuda.empty_cache()
+                continue
+            dec.last_execution_mode = name
+            return DecodeResult(value.mul_(2).sub_(1), None)
+        raise RuntimeError("Tiny Decoder produced no output")
+
+    return segment
+
+
 def _instrument(pipe):
     """Phase timers on the model's own seams + the knobs' switches. The model's code is not
     edited (it is a pinned upstream commit); its module attributes are wrapped once."""
@@ -147,7 +208,10 @@ def _instrument(pipe):
         RS.WaveletColorCorrector = CardColor
         RS._tmb_instrumented = True
     b = pipe.bundle
-    b.decoder.decode_stream_segment = _timed("decode", b.decoder.decode_stream_segment)
+    b.decoder.decode_stream_segment = _timed("decode", _segment_decoder(b.decoder))
+    # the decoder network itself, nested in "decode": what stays in "decode" is the model's host
+    # round trips around it (memory snapshot, outputs to the host, the [-1, 1] rescale there)
+    b.decoder.module.decode_video = _timed("decode_net", b.decoder.module.decode_video)
     b.denoiser.forward_stream = _timed("dit", b.denoiser.forward_stream)
     pipe.runner._project_lq_chunk = _timed("proj", pipe.runner._project_lq_chunk)
 
@@ -435,4 +499,5 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
             "phases_s": {k: round(v, 2) for k, v in sorted(phases.items(), key=lambda kv: -kv[1])},
             "threads": torch.get_num_threads(), "cpu_quota": cpu_quota(),
             "knobs": dict(KNOBS), "keep_dit": _RUN["keep_dit"], "decode_every": decode_every,
+            "decoder_mode": pipe.bundle.decoder.last_execution_mode,
             "peak_gib": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)}
