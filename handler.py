@@ -731,6 +731,39 @@ def _bench_post(cfg: dict) -> dict:
             "post_on_card": _POST_ON_CARD["ok"], "post_fallback": _POST_ON_CARD["fallback"] or None}
 
 
+def _bench_engine(cfg: dict) -> dict:
+    """{"probe": true, "bench_engine": {"model": "flashvsr-turbo", "w", "h", "box": [ow, oh], "frames"}} —
+    a stream engine on THIS host without a job, an upload or a delivery: synthetic frames
+    (lavfi testsrc2; a diffusion model's cost does not depend on content) through the engine
+    twice, the second pass is the number. Answers the two things the web tier prices on and
+    no machine of ours can measure — does the image run the engine on a pool card, and how
+    many GPU seconds a megapixel of OUTPUT costs (`s_per_out_mpx_frame`)."""
+    import importlib
+    key = cfg.get("model", "flashvsr-turbo")
+    if key not in ENGINES:
+        return {"error": "unknown_engine", "model": key}
+    w, h = int(cfg.get("w", 480)), int(cfg.get("h", 270))
+    n = max(9, min(97, int(cfg.get("frames", 33))))
+    ow, oh = (cfg.get("box") or [w * 4, h * 4])[:2]
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate=25",
+                          "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                         capture_output=True, timeout=120).stdout
+    frames = [np.frombuffer(raw[i * w * h * 3:(i + 1) * w * h * 3], dtype=np.uint8).reshape(h, w, 3) for i in range(n)]
+    mod = importlib.import_module(ENGINES[key][0])
+    passes = []
+    for _ in range(2):
+        got = {"n": 0}
+        t = time.time()
+        facts = mod.upscale_stream(iter(frames), w, h, ow, oh, lambda f: got.__setitem__("n", got["n"] + 1), mode=ENGINES[key][1])
+        passes.append({"s": round(time.time() - t, 2), "frames_out": got["n"], **facts})
+    warm = passes[-1]
+    mpx = ow * oh / 1e6
+    return {"bench_engine": True, "model": key, "gpu": _gpu_name(), "driver": _driver_version(),
+            "src": f"{w}x{h}", "box": f"{ow}x{oh}", "frames": n, "passes": passes,
+            "s_per_frame": round(warm["s"] / max(1, warm["frames_out"]), 4),
+            "s_per_out_mpx_frame": round(warm["s"] / max(1, warm["frames_out"]) / mpx, 4), **_mem_facts()}
+
+
 def _encoder_probe_report() -> dict:
     """{"probe": true} — what THIS host can encode, and why not, without a
     model, a download or a token (the demucs worker's free probe, same idea)."""
@@ -791,6 +824,8 @@ def _handle(job):
     _POST_ON_CARD.update(ok=True, fallback="")   # a warm worker starts every job on the card
     if inp.get("probe") and inp.get("bench_post"):
         return _bench_post(inp["bench_post"])
+    if inp.get("probe") and inp.get("bench_engine"):
+        return _bench_engine(inp["bench_engine"])
     if inp.get("probe"):
         return _encoder_probe_report()
     in_url, out_url = inp.get("in_url"), inp.get("out_url")
