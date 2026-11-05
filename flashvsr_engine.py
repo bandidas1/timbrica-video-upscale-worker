@@ -17,6 +17,7 @@ LQ frames are bicubic-resized (PIL, a=-0.5) to the target and scaled to [-1, 1];
 multiples of 128 — we pad bottom/right by reflection and crop the output back, so no pixel of
 the picture is cropped or stretched beyond the box rounding the ESRGAN path already does.
 """
+import concurrent.futures
 import contextlib
 import functools
 import os
@@ -47,10 +48,18 @@ _CACHE = {}
 #                   (6-8.5 s of a run). "auto" = keep up to the measured 1440p model area.
 #   prefetch      — LQ frames resized and packed in a background thread, one chunk ahead, so the
 #                   card does not wait for PIL: 1440p, 97 frames, pool PRO 6000 73.4 -> 59.5 s.
-#   decode_on_card — the decoder's memory and output stay on the card (_segment_decoder); under test.
+#   decode_on_card — the decoder's memory and output stay on the card (_segment_decoder): the
+#                   model's adapter moved them to the host and back every segment — 11.6-12.2 s
+#                   of 60 at 1440p/97 frames on a pool 4090; on the card 0.9 s (61.7/58.5 ->
+#                   50.0 s), peak 18.6 -> 20.2 GiB of 23.5. "auto" = with keep_dit's area rule.
+#   resize_threads — PIL resizes of one chunk in parallel (it releases the GIL): the first chunk
+#                   cannot overlap the card, and one thread at 0.27 s/frame (a pool 4090's host,
+#                   1440p) made the card wait 8.5 s for it.
 # (A thread-count knob was measured and dropped: the pool pod has no cgroup CPU quota, 64 threads.)
-KNOBS = {"color_on_card": True, "keep_dit": "auto", "prefetch": True, "decode_on_card": False}
-KEEP_DIT_MAX_AREA = 2560 * 1536   # model area of a 1440p box: peak 18.6 GiB on a 24 GB card
+KNOBS = {"color_on_card": True, "keep_dit": "auto", "prefetch": True, "decode_on_card": "auto",
+         "resize_threads": 8}
+KEEP_DIT_MAX_AREA = 2560 * 1536   # model area of a 1440p box: peak 20.2 GiB on a 24 GB card with
+                                  # keep_dit + decode_on_card (pool 4090, 97 frames)
 _PH = {"cur": None, "stack": []}
 
 
@@ -74,7 +83,7 @@ def cpu_quota():
         return None
 
 
-_RUN = {"keep_dit": False}   # the knobs resolved for the run in progress (the wrappers read it)
+_RUN = {"keep_dit": False, "decode_on_card": False}   # knobs resolved for the run in progress
 
 
 @contextlib.contextmanager
@@ -143,7 +152,7 @@ def _segment_decoder(dec):
         return torch.cat(outputs, dim=2)
 
     def segment(latents, lq_video, *, first=False):
-        if not KNOBS["decode_on_card"]:
+        if not _RUN["decode_on_card"]:
             return orig(latents, lq_video, first=first)
         from inference.decoders.base import DecodeResult
         if first:
@@ -371,40 +380,39 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
     OW, OH = model_dims(ow, oh)
     tc = pipe.config.temporal_compression
     chunk = decode_every * tc
-    kd = KNOBS["keep_dit"]
-    _RUN["keep_dit"] = (OW * OH <= KEEP_DIT_MAX_AREA) if kd == "auto" else bool(kd)
+    fits = OW * OH <= KEEP_DIT_MAX_AREA
+    for knob in ("keep_dit", "decode_on_card"):
+        v = KNOBS[knob]
+        _RUN[knob] = fits if v == "auto" else bool(v)
     lq_busy = {"src": 0.0, "prep": 0.0}   # producer time: on the critical path only without prefetch
 
     def lq_chunks():
         """The model's LQ input: frames bicubic-resized (PIL, the model's own preprocessing) and
         packed into chunks. Times itself without _phase — with prefetch it runs in another thread."""
-        buf = []
+        raw = []
         first = True
         src = iter(frames)
         while True:
             t = time.perf_counter()
             bgr = next(src, None)   # the caller's decoder (ffmpeg pipe in a job)
             lq_busy["src"] += time.perf_counter() - t
+            if bgr is not None:
+                raw.append(bgr)
+            need = chunk + 1 if first else chunk
+            if raw and (bgr is None or len(raw) >= need):
+                t = time.perf_counter()
+                packed = _to_tensor(list(pool.map(_resize, raw)) if pool else [_resize(f) for f in raw])
+                lq_busy["prep"] += time.perf_counter() - t
+                raw, first = [], False
+                yield packed
             if bgr is None:
                 break
-            t = time.perf_counter()
-            rgb = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
-            if (w, h) != (ow, oh):
-                rgb = rgb.resize((ow, oh), Image.Resampling.BICUBIC)
-            buf.append(np.asarray(rgb))
-            need = chunk + 1 if first else chunk
-            ready = len(buf) >= need
-            if ready:
-                packed = _to_tensor(buf)
-                buf, first = [], False
-            lq_busy["prep"] += time.perf_counter() - t
-            if ready:
-                yield packed
-        if buf:
-            t = time.perf_counter()
-            packed = _to_tensor(buf)
-            lq_busy["prep"] += time.perf_counter() - t
-            yield packed
+
+    def _resize(bgr):
+        rgb = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
+        if (w, h) != (ow, oh):
+            rgb = rgb.resize((ow, oh), Image.Resampling.BICUBIC)
+        return np.asarray(rgb)
 
     def prefetched(gen):
         """`gen` one chunk ahead in a thread (PIL and the packing release the GIL), so the card
@@ -476,6 +484,8 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
             pass
 
     prefetch = bool(KNOBS["prefetch"])
+    rt = int(KNOBS["resize_threads"] or 1)
+    pool = concurrent.futures.ThreadPoolExecutor(rt, thread_name_prefix="flashvsr-resize") if rt > 1 else None
     stream = TemporalVideoStream(prefetched(lq_chunks()) if prefetch else lq_chunks(), tc, TEMPORAL_DOWNSAMPLE)
     torch.cuda.reset_peak_memory_stats()
     phases = {}
@@ -486,6 +496,8 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
     finally:
         _PH.update(cur=None, stack=[])
         stream.close()
+        if pool:
+            pool.shutdown(wait=True)
     torch.cuda.synchronize()
     total = time.perf_counter() - t0
     if not prefetch:   # on the critical path: part of the wall time (never nested in another phase)
@@ -498,6 +510,7 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
             "model_s": round(total, 1),
             "phases_s": {k: round(v, 2) for k, v in sorted(phases.items(), key=lambda kv: -kv[1])},
             "threads": torch.get_num_threads(), "cpu_quota": cpu_quota(),
-            "knobs": dict(KNOBS), "keep_dit": _RUN["keep_dit"], "decode_every": decode_every,
+            "knobs": dict(KNOBS), "keep_dit": _RUN["keep_dit"], "decode_on_card": _RUN["decode_on_card"],
+            "decode_every": decode_every,
             "decoder_mode": pipe.bundle.decoder.last_execution_mode,
             "peak_gib": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)}
