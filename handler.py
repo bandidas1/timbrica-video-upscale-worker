@@ -73,7 +73,8 @@ except Exception:
 MODELS = {
     # (weights file, netscale, is_compact)
     "general-x4v3": ("realesr-general-x4v3.pth", 4, True),
-    # The same compact net WITHOUT the denoise training (Real-ESRGAN's denoise_strength 0).
+    # The same compact net trained with WEAK denoise (Real-ESRGAN's denoise_strength 0;
+    # x4v3 is strength 1, the strong one).
     # The site's classic engine since 2026-11-06: on the upscaler bench (16 clips with an
     # original) it beats x4v3 on every fidelity axis — LPIPS x2 0.195 vs 0.236, x4 0.342 vs
     # 0.375, PSNR +1.8 / +0.6 dB, NIQE on real old clips 6.2 vs 8.6 — at the same cost (same

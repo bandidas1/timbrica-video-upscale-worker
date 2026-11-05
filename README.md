@@ -44,7 +44,7 @@ Building from this Dockerfile replaces all of that with an image pull.
 
 | model | engine | runs at | cost grows with |
 |---|---|---|---|
-| `general-x4v3` (default), `x4plus` | Real-ESRGAN per frame (`_frame_bgr`) | ×4, then area-reduced to the box | input pixels |
+| `general-wdn-x4v3` (the site's classic since 2026-11-06), `general-x4v3` (default of an input without `model`), `x4plus` | Real-ESRGAN per frame (`_frame_bgr`) | ×4, then area-reduced to the box | input pixels |
 | `flashvsr-turbo` | FlashVSR+ Turbo stream (`flashvsr_engine.py`) | the box itself (padded to 128 by reflection, cropped back) | output pixels |
 
 FlashVSR+ (OpenImagingLab, Apache-2.0; Wan2.1-1.3B, Apache-2.0) is a one-step diffusion video
@@ -66,8 +66,18 @@ through the kernel and through `exact_block_sparse` (plain torch, the same softm
 same keys, checked against the model's own reference in CI); a kernel that does not build or
 disagrees is replaced by the exact path, and the job's `engine.attn` / `attn_why` say which ran.
 
-Measured on the pool (free probe `{"probe": true, "bench_engine": {...}}`, RTX 4090): 1080p
-0.87 s per frame steady, 1440p 0.37 s per output megapixel; 4K does not fit 24 GB — the web
-tier sells restore up to 1440p. Everything that broke on the way was found by probes on a pool
+Speed (2026-11-06). The job record carries `engine.phases_s` — exclusive wall time per phase
+on the model's own seams (`dit`, `proj`, `decode` / `decode_net`, `offload` / `restore`, `color`)
+and ours (`wait_lq`, `prep`, `write`, `emit`). Measured with them, more than half of a run was
+not the model: the wavelet colour correction on the pod's CPU, the DiT moved to the host and
+back around every decoder segment, the decoder's memory and output to the host and back, PIL
+resizes queued in front of the card. `KNOBS` in `flashvsr_engine.py` (all defaults on; the
+memory-bound two by area — up to the 1440p model area, peak 20.2 GiB on a 24 GB card) keep it
+on the card or in a background thread. Every variant of every probe: frames identical byte for
+byte. MIG 2g.48gb, 1440p/97 frames 130.0 -> 52.1 s; 1080p/33 0.175 s per output MPx, 1440p/33
+0.181. The free probe takes `"variants": [{knob: value}, …]` — run in order on ONE host, each
+compared to the first — because hosts differ more than knobs do. 4K does not fit 24 GB — the
+web tier sells restore up to 1440p. `bench_post` takes `"model"`; probes report `gpu_mem_gb`
+(a MIG slice and the whole card share one name). Everything that broke on the way was found by probes on a pool
 card, never on the dev boxes, and each is now a check in the patch workflow: `inference` not on
 `sys.path`, a dangling `TCDecoder.ckpt` symlink, no C compiler for Triton.
