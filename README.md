@@ -57,7 +57,17 @@ spend (`engine_out_too_big`). Why it is here and the bench behind it — the sit
 It ships as LAYERS on the production digest, not a rebuild (`patch-flashvsr.yml`): pinned
 FlashVSR+ code in `/opt/flashvsr`, its Triton stream attention + pure-Python deps in
 `/opt/pydeps` (appended to `sys.path`, nothing in the base shadowed), Turbo weights stored bf16
-in `/opt/flashvsr/ckpts`, then `handler.py` + `flashvsr_engine.py`. Triton comes with the base's
-torch 2.7.1. Checked before shipping: the real `_handle()` with `flashvsr-turbo` on an RTX 4060
-(CUDA, the model's Triton kernel, NVENC) — 160×90 → 640×360, 30 frames in, 30 out, audio kept,
-peak 4.1 GiB.
+in `/opt/flashvsr/ckpts`, a self-contained C toolchain in `/opt/cc` (conda-forge gcc with its own
+sysroot — Triton builds its driver module and kernel launchers with a C compiler, the runtime
+base has none), then `handler.py` + `flashvsr_engine.py`.
+
+The engine trusts the Triton kernel only by its ANSWER: at first use it runs a known input
+through the kernel and through `exact_block_sparse` (plain torch, the same softmax over the
+same keys, checked against the model's own reference in CI); a kernel that does not build or
+disagrees is replaced by the exact path, and the job's `engine.attn` / `attn_why` say which ran.
+
+Measured on the pool (free probe `{"probe": true, "bench_engine": {...}}`, RTX 4090): 1080p
+0.87 s per frame steady, 1440p 0.37 s per output megapixel; 4K does not fit 24 GB — the web
+tier sells restore up to 1440p. Everything that broke on the way was found by probes on a pool
+card, never on the dev boxes, and each is now a check in the patch workflow: `inference` not on
+`sys.path`, a dangling `TCDecoder.ckpt` symlink, no C compiler for Triton.
