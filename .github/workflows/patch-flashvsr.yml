@@ -96,6 +96,9 @@ jobs:
       - name: Engine imports from the layers alone
         run: |
           set -eu
+          # what the BASE image already carries (Dockerfile: numpy, opencv-python-headless; torch
+          # brings pillow) — the deps layer must not need anything beyond that and itself
+          python -m pip install --quiet opencv-python-headless pillow
           FLASHVSR_DIR="$PWD/l1/opt/flashvsr" FLASHVSR_PYDEPS="$PWD/l2/opt/pydeps" python - <<'EOF'
           import sys
           sys.path.insert(0, ".")
