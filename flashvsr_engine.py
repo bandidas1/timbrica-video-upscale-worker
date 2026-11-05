@@ -36,14 +36,22 @@ def model_dims(ow: int, oh: int) -> tuple:
     return -(-ow // MULT) * MULT, -(-oh // MULT) * MULT
 
 
-def _pipeline(mode: str, decode_every: int):
-    key = (mode, decode_every)
-    if key in _CACHE:
-        return _CACHE[key]
+def _paths():
+    """The model's code and the deps layer onto sys.path — BEFORE any `inference` import.
+    In the image nothing is pip-installed (layers only); on a dev box the package may be,
+    which is exactly how an import placed before this call hid on the laptop and M5 and
+    failed on the first pool card (probe 05.11: «No module named 'inference'»)."""
     if FVP_DIR not in sys.path:
         sys.path.insert(0, FVP_DIR)
     if os.path.isdir(PYDEPS) and PYDEPS not in sys.path:
         sys.path.append(PYDEPS)
+
+
+def _pipeline(mode: str, decode_every: int):
+    key = (mode, decode_every)
+    if key in _CACHE:
+        return _CACHE[key]
+    _paths()
     import torch
     from pathlib import Path
     from inference import build_inference_pipeline
@@ -65,6 +73,7 @@ def upscale_stream(frames, w: int, h: int, ow: int, oh: int, emit, *, mode: str 
                    decode_every: int = 8, on_progress=None) -> dict:
     """frames: iterator of BGR uint8 (h, w, 3); emit(bgr uint8 (oh, ow, 3)) for every output frame.
     Returns facts for the job record: model frames, peak memory, model size."""
+    _paths()
     import torch
     import torch.nn.functional as F
     from PIL import Image

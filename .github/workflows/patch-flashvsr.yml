@@ -90,6 +90,28 @@ jobs:
           EOF
           du -sh l3
 
+      # The image installs nothing — the engine must import from the LAYERS alone. 05.11 the first
+      # pool card answered «No module named 'inference'»: an import placed before the engine put
+      # /opt/flashvsr on sys.path, hidden on dev boxes where the package was pip-installed.
+      - name: Engine imports from the layers alone
+        run: |
+          set -eu
+          FLASHVSR_DIR="$PWD/l1/opt/flashvsr" FLASHVSR_PYDEPS="$PWD/l2/opt/pydeps" python - <<'EOF'
+          import sys
+          sys.path.insert(0, ".")
+          import flashvsr_engine as E
+          E._paths()
+          from inference.preprocessing.stream import TemporalVideoStream  # noqa: F401
+          from inference.config import TEMPORAL_DOWNSAMPLE  # noqa: F401
+          from inference import build_inference_pipeline  # noqa: F401
+          from inference.presets import model_paths_for_mode, stream_config_for_mode
+          import flashvsr_attn  # noqa: F401
+          from pathlib import Path
+          p = model_paths_for_mode(Path(E.FVP_DIR), "turbo")
+          assert stream_config_for_mode("turbo", device="cpu", decode_every=8, temporal_compression=4, color_correction=True)
+          print("engine imports from the layers:", p.dit)
+          EOF
+
       - uses: imjasonh/setup-crane@v0.4
 
       - name: Append onto the production image
